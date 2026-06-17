@@ -1,0 +1,12 @@
+name: molgame
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - openmm>=8.1
+  - pdbfixer
+  - pygame>=2.5
+  - pyopengl
+  - numpy
+  - scipy
+  - scikit-image
