@@ -20,14 +20,14 @@ from pdbfixer import PDBFixer
 # ── Configuration ───────────────────────────────────────────
 W, H            = 1280, 720
 FPS_CAP         = 60
-MD_STEPS        = 15
+MD_STEPS        = 8
 DT              = 0.004
 FORCE_MAG       = 500.0
 FRICTION        = 5.0
 MOUSE_SENS      = 0.15
 SCROLL_SENS     = 0.5
 TEMPERATURE     = 300.0
-RESTRAINT_K     = 1000.0
+RESTRAINT_K     = 0.0
 CONTACT_CUT     = 0.5
 
 CPK = {"C": (0.32, 0.32, 0.32), "N": (0.14, 0.20, 0.65),
@@ -187,13 +187,13 @@ def prepare(pdb_path):
         modeller.topology, nonbondedMethod=app.PME,
         nonbondedCutoff=0.9 * unit.nanometers, constraints=app.HBonds)
 
-    rst = mm.CustomExternalForce("k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
-    rst.addPerParticleParameter("k")
+    rst = mm.CustomExternalForce("rst_k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+    rst.addGlobalParameter("rst_k", RESTRAINT_K)
     rst.addPerParticleParameter("x0")
     rst.addPerParticleParameter("y0")
     rst.addPerParticleParameter("z0")
     for idx in ca_idx:
-        rst.addParticle(idx, [RESTRAINT_K] + pos[idx].tolist())
+        rst.addParticle(idx, pos[idx].tolist())
     system.addForce(rst)
 
     lig_idx = system.addParticle(40.0)
@@ -225,10 +225,15 @@ def prepare(pdb_path):
     ctx.setVelocitiesToTemperature(TEMPERATURE * unit.kelvin)
     print("      Equilibrating …")
     integrator.step(500)
+    box = ctx.getState().getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
+    box_origin = pos.min(axis=0)
+
+    print(f"      Box: {box[0][0]:.2f} x {box[1][1]:.2f} x {box[2][2]:.2f} nm")
     print(f"      Ready in {time.time()-t0:.1f}s\n")
     return (ctx, integrator,
             np.array(prot_heavy), np.array(prot_elem),
-            np.array(water_o), ligand, prot_center, surface_data)
+            np.array(water_o), ligand, prot_center, surface_data,
+            box_origin, np.diag(box))
 
 
 # ── Camera ──────────────────────────────────────────────────
@@ -255,8 +260,8 @@ class Camera:
         gluLookAt(*eye, *self.target, 0, 1, 0)
 
     def forward(self):
-        yr = math.radians(self.yaw)
-        return np.array([-math.sin(yr), 0, -math.cos(yr)])
+        yr, pr = math.radians(self.yaw), math.radians(self.pitch)
+        return np.array([-math.sin(yr)*math.cos(pr), -math.sin(pr), -math.cos(yr)*math.cos(pr)])
 
     def right(self):
         yr = math.radians(self.yaw)
@@ -267,19 +272,17 @@ class Camera:
 _sdl = None
 _quad = None
 _surf_dl = None
-_pxfont = None
-_pxfont_sm = None
-PX_SCALE = 2
+_hud_font = None
+_hud_font_sm = None
 
 
-def _px(text, color, big=True):
-    global _pxfont, _pxfont_sm
-    if _pxfont is None:
-        _pxfont = pygame.font.SysFont("menlo", 11)
-        _pxfont_sm = pygame.font.SysFont("menlo", 9)
-    font = _pxfont if big else _pxfont_sm
-    s = font.render(text, False, color)
-    return pygame.transform.scale(s, (s.get_width() * PX_SCALE, s.get_height() * PX_SCALE))
+def _txt(text, color, big=True):
+    global _hud_font, _hud_font_sm
+    if _hud_font is None:
+        _hud_font = pygame.font.SysFont("menlo", 14)
+        _hud_font_sm = pygame.font.SysFont("menlo", 11)
+    font = _hud_font if big else _hud_font_sm
+    return font.render(text, True, color)
 
 
 def gl_init(aw, ah):
@@ -324,15 +327,21 @@ def draw_protein_surface():
         glCallList(_surf_dl)
 
 
-def draw_water(pos, water_o):
-    wp = pos[water_o].astype(np.float32)
+WATER_VIS_CUT = 1.5
+
+def draw_water(pos, water_o, lig_pos):
+    wp_all = pos[water_o]
+    dists = np.linalg.norm(wp_all - lig_pos, axis=1)
+    nearby = wp_all[dists < WATER_VIS_CUT].astype(np.float32)
+    if len(nearby) == 0:
+        return
     glDisable(GL_LIGHTING)
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
     glColor4f(0.40, 0.60, 0.92, 0.30)
     glPointSize(2.0)
     glEnableClientState(GL_VERTEX_ARRAY)
-    glVertexPointer(3, GL_FLOAT, 0, wp)
-    glDrawArrays(GL_POINTS, 0, len(wp))
+    glVertexPointer(3, GL_FLOAT, 0, nearby)
+    glDrawArrays(GL_POINTS, 0, len(nearby))
     glDisableClientState(GL_VERTEX_ARRAY)
     glDisable(GL_BLEND); glEnable(GL_LIGHTING)
 
@@ -354,20 +363,45 @@ def draw_ligand(pos, lig):
     glDisable(GL_BLEND); glEnable(GL_LIGHTING)
 
 
-def draw_grid(prot_center, extent=3.0, step=0.5):
-    y = prot_center[1] - 2.0
-    cx, cz = prot_center[0], prot_center[2]
+def draw_grid(origin, lengths, step=0.5):
+    y = origin[1]
+    x0, z0 = origin[0], origin[2]
+    x1, z1 = x0 + lengths[0], z0 + lengths[2]
     glDisable(GL_LIGHTING)
     glColor3f(0.07, 0.14, 0.20)
     glLineWidth(1.0)
     glBegin(GL_LINES)
-    n = int(extent / step)
-    for i in range(-n, n + 1):
-        v = i * step
-        glVertex3f(cx + v, y, cz - extent)
-        glVertex3f(cx + v, y, cz + extent)
-        glVertex3f(cx - extent, y, cz + v)
-        glVertex3f(cx + extent, y, cz + v)
+    x = x0
+    while x <= x1 + 1e-6:
+        glVertex3f(x, y, z0); glVertex3f(x, y, z1)
+        x += step
+    z = z0
+    while z <= z1 + 1e-6:
+        glVertex3f(x0, y, z); glVertex3f(x1, y, z)
+        z += step
+    glEnd()
+    glEnable(GL_LIGHTING)
+
+
+def draw_box(origin, lengths):
+    o = origin
+    L = lengths
+    glDisable(GL_LIGHTING)
+    glColor3f(0.15, 0.35, 0.45)
+    glLineWidth(1.5)
+    glBegin(GL_LINES)
+    for dx, dy in [(0,0),(L[0],0),(L[0],L[1]),(0,L[1])]:
+        glVertex3f(o[0]+dx, o[1]+dy, o[2])
+        glVertex3f(o[0]+dx, o[1]+dy, o[2]+L[2])
+    for dz in [0, L[2]]:
+        glVertex3f(o[0],     o[1],     o[2]+dz)
+        glVertex3f(o[0]+L[0],o[1],     o[2]+dz)
+        glVertex3f(o[0]+L[0],o[1],     o[2]+dz)
+        glVertex3f(o[0]+L[0],o[1]+L[1],o[2]+dz)
+        glVertex3f(o[0]+L[0],o[1]+L[1],o[2]+dz)
+        glVertex3f(o[0],     o[1]+L[1],o[2]+dz)
+        glVertex3f(o[0],     o[1]+L[1],o[2]+dz)
+        glVertex3f(o[0],     o[1],     o[2]+dz)
     glEnd()
     glEnable(GL_LIGHTING)
 
@@ -396,6 +430,26 @@ def draw_axes(aw, ah, cam):
     glViewport(0, 0, aw, ah)
 
 
+def draw_crosshair(aw, ah, size=12, gap=4):
+    cx, cy = aw // 2, ah // 2
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, aw, 0, ah, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING)
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glColor4f(1.0, 1.0, 1.0, 0.5)
+    glLineWidth(1.5)
+    glBegin(GL_LINES)
+    glVertex2i(cx - size, cy); glVertex2i(cx - gap, cy)
+    glVertex2i(cx + gap, cy);  glVertex2i(cx + size, cy)
+    glVertex2i(cx, cy - size); glVertex2i(cx, cy - gap)
+    glVertex2i(cx, cy + gap);  glVertex2i(cx, cy + size)
+    glEnd()
+    glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW); glPopMatrix()
+
+
 # ── Scanline CRT overlay ───────────────────────────────────
 def draw_scanlines(aw, ah):
     glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
@@ -413,14 +467,13 @@ def draw_scanlines(aw, ah):
     glMatrixMode(GL_MODELVIEW); glPopMatrix()
 
 
-# ── Pixel HUD ──────────────────────────────────────────────
+# ── HUD ────────────────────────────────────────────────────
 def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
              hi_score, fps, active_keys, show_surface, frame):
-    pad = 12
-    lh_big = 28
-    bw = 540
+    pad = 8
+    lh = 20
+    bw = 310
 
-    # ── pre-compute status ──
     if contacts >= 12:
         flash = (frame // 8) % 2
         st_txt, st_col = "IN POCKET!", PX["ok"] if flash else PX["title"]
@@ -429,96 +482,59 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
     else:
         st_txt, st_col = "EXPLORING", PX["dim"]
 
-    # ── build surface ──
-    bh = 380
+    bh = 260
     surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
-    surf.fill(PX["bg"])
-
-    # double border
-    pygame.draw.rect(surf, PX["border"], (0, 0, bw, bh), 2)
-    pygame.draw.rect(surf, PX["border2"], (3, 3, bw - 6, bh - 6), 1)
+    surf.fill((6, 6, 16, 180))
+    pygame.draw.rect(surf, PX["border2"], (0, 0, bw, bh), 1)
 
     y = pad
 
-    # ── title ──
-    title = _px("M O L G A M E", PX["title"])
-    tx = (bw - title.get_width()) // 2
-    surf.blit(title, (tx, y))
-    # decorative diamonds
-    dy = y + title.get_height() // 2
-    for dx_off in [-16, title.get_width() + 8]:
-        cx = tx + dx_off
-        pts = [(cx, dy - 4), (cx + 4, dy), (cx, dy + 4), (cx - 4, dy)]
-        pygame.draw.polygon(surf, PX["title"], pts)
-    y += title.get_height() + 4
+    # title + stage
+    surf.blit(_txt(f"MOLGAME  {pdb_id}", PX["title"]), (pad, y))
+    y += lh
 
-    # separator
-    pygame.draw.line(surf, PX["sep"], (pad, y), (bw - pad, y))
-    y += 6
-
-    # ── stage ──
-    s1 = _px("STAGE ", PX["dim"])
-    s2 = _px(pdb_id, PX["stage"])
-    surf.blit(s1, (pad, y))
-    surf.blit(s2, (pad + s1.get_width(), y))
-    if pdb_title:
-        s3 = _px(f" {pdb_title}", PX["text"], big=False)
-        surf.blit(s3, (pad + s1.get_width() + s2.get_width() + 4, y + 4))
-    y += lh_big
-
-    pygame.draw.line(surf, PX["sep"], (pad, y), (bw - pad, y))
-    y += 6
-
-    # ── proximity bar ──
-    lbl = _px("PROXIMITY", PX["text"])
-    surf.blit(lbl, (pad, y))
-
-    bar_x = pad + lbl.get_width() + 10
-    bar_y = y + 4
-    seg_w, seg_h = 13, 17
-    gap = 2
+    # proximity bar
+    bar_x = pad
+    seg_w, seg_h = 10, 12
     max_seg = 15
     fill = min(max_seg, contacts)
     for i in range(max_seg):
-        sx = bar_x + i * (seg_w + gap)
+        sx = bar_x + i * (seg_w + 2)
         if i < fill:
             t = i / max(1, max_seg - 1)
             c = PX["bar_lo"] if t < 0.4 else PX["bar_mid"] if t < 0.7 else PX["bar_hi"]
         else:
             c = PX["bar_bg"]
-        pygame.draw.rect(surf, c, (sx, bar_y, seg_w, seg_h))
+        pygame.draw.rect(surf, c, (sx, y, seg_w, seg_h))
+    surf.blit(_txt(f" {contacts}", PX["text"], big=False),
+              (bar_x + max_seg * (seg_w + 2) + 2, y - 1))
+    y += seg_h + 6
 
-    ct = _px(f"{contacts:2d}", PX["text"])
-    surf.blit(ct, (bar_x + max_seg * (seg_w + gap) + 4, y))
-    y += lh_big + 2
-
-    # ── status ──
-    surf.blit(_px(f"STATUS    {st_txt}", st_col), (pad, y))
-    y += lh_big
-
-    # ── hi-score ──
-    surf.blit(_px(f"HI-SCORE  {hi_score}", PX["ok"]), (pad, y))
-    y += lh_big
+    # status + hi-score
+    surf.blit(_txt(st_txt, st_col), (pad, y))
+    hi_t = _txt(f"HI {hi_score}", PX["ok"], big=False)
+    surf.blit(hi_t, (bw - pad - hi_t.get_width(), y + 2))
+    y += lh + 2
 
     pygame.draw.line(surf, PX["sep"], (pad, y), (bw - pad, y))
-    y += 6
+    y += 5
 
-    # ── info ──
-    surf.blit(_px(f"PE   {pe:11.0f} kJ/mol", PX["dim"]), (pad, y))
-    y += lh_big
-    surf.blit(_px(f"TEMP {temp:5.0f}K   FPS {fps:4.0f}", PX["dim"]), (pad, y))
-    y += lh_big
-    vn = "SURFACE" if show_surface else "ATOMS"
-    surf.blit(_px(f"VIEW  {vn}  [V]", PX["dim"]), (pad, y))
-    y += lh_big
+    # info
+    surf.blit(_txt(f"PE {pe:10.0f} kJ/mol", PX["dim"], big=False), (pad, y))
+    y += lh - 4
+    surf.blit(_txt(f"Temp {temp:5.0f}K  FPS {fps:3.0f}", PX["dim"], big=False), (pad, y))
+    y += lh - 4
+    vn = "Surface" if show_surface else "Spheres"
+    surf.blit(_txt(f"View: {vn} [V]", PX["dim"], big=False), (pad, y))
+    y += lh - 2
 
     pygame.draw.line(surf, PX["sep"], (pad, y), (bw - pad, y))
-    y += 8
+    y += 5
 
-    # ── key indicators ──
+    # key indicators
     key_labels = ["W", "A", "S", "D", "SPC", "SHF"]
-    box_w_map = {"W": 34, "A": 34, "S": 34, "D": 34, "SPC": 50, "SHF": 50}
-    box_h = 26
+    box_w_map = {"W": 26, "A": 26, "S": 26, "D": 26, "SPC": 38, "SHF": 38}
+    box_h = 20
     kx = pad
     for label, active in zip(key_labels, active_keys):
         kw = box_w_map[label]
@@ -527,24 +543,20 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
         fg = (0, 0, 0) if active else PX["dim"]
         pygame.draw.rect(surf, bg, (kx, y, kw, box_h))
         pygame.draw.rect(surf, brd, (kx, y, kw, box_h), 1)
-        if active:
-            pygame.draw.rect(surf, (180, 255, 200, 60), (kx + 2, y + 2, kw - 4, box_h // 2 - 2))
-        kt = _px(label, fg, big=False)
+        kt = _txt(label, fg, big=False)
         surf.blit(kt, (kx + (kw - kt.get_width()) // 2,
                         y + (box_h - kt.get_height()) // 2))
-        kx += kw + 4
-    y += box_h + 6
+        kx += kw + 3
+    y += box_h + 4
 
-    surf.blit(_px("MOUSE:LOOK  SCROLL:ZOOM  ESC:QUIT", PX["dim"], big=False),
+    surf.blit(_txt("Mouse:look  Scroll:zoom  ESC:quit", PX["dim"], big=False),
               (pad, y))
-    y += 22
+    y += 16
 
-    # ── crop and blit ──
-    final_h = y + 6
+    # crop and blit
+    final_h = y + 4
     out = surf.subsurface((0, 0, bw, final_h)).copy()
-    # redraw border on cropped size
-    pygame.draw.rect(out, PX["border"], (0, 0, bw, final_h), 2)
-    pygame.draw.rect(out, PX["border2"], (3, 3, bw - 6, final_h - 6), 1)
+    pygame.draw.rect(out, PX["border2"], (0, 0, bw, final_h), 1)
 
     data = pygame.image.tostring(out, "RGBA", True)
     sw, sh = out.get_size()
@@ -553,7 +565,54 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
     glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
     glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING)
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glRasterPos2i(14, ah - sh - 14)
+    glRasterPos2i(10, ah - sh - 10)
+    glDrawPixels(sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, data)
+    glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
+    glMatrixMode(GL_PROJECTION); glPopMatrix()
+    glMatrixMode(GL_MODELVIEW); glPopMatrix()
+
+
+# ── Pause menu ─────────────────────────────────────────────
+def draw_pause_menu(aw, ah, params, sel):
+    pw, ph = 360, len(params) * 28 + 70
+    surf = pygame.Surface((pw, ph), pygame.SRCALPHA)
+    surf.fill((6, 6, 20, 220))
+    pygame.draw.rect(surf, (0, 180, 220), (0, 0, pw, ph), 2)
+
+    y = 10
+    title = _txt("PAUSED  [P] resume", (255, 200, 50))
+    surf.blit(title, ((pw - title.get_width()) // 2, y))
+    y += 30
+    pygame.draw.line(surf, (40, 60, 80), (10, y), (pw - 10, y))
+    y += 8
+
+    for i, p in enumerate(params):
+        selected = (i == sel)
+        col = (0, 255, 200) if selected else (160, 160, 180)
+        arrow = "> " if selected else "  "
+        v = p["val"]
+        if "choices" in p:
+            vstr = p["choices"][int(v)]
+        elif v == int(v):
+            vstr = f"{int(v)}"
+        else:
+            vstr = f"{v:.1f}"
+        line = f"{arrow}{p['name']:14s} {vstr:>8s} {p['unit']}"
+        surf.blit(_txt(line, col, big=False), (10, y))
+        y += 28
+
+    surf.blit(_txt("  Left/Right to adjust", (100, 100, 130), big=False),
+              (10, y))
+
+    data = pygame.image.tostring(surf, "RGBA", True)
+    sw, sh = surf.get_size()
+    cx, cy = (aw - sw) // 2, (ah - sh) // 2
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity()
+    glOrtho(0, aw, 0, ah, -1, 1)
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity()
+    glDisable(GL_DEPTH_TEST); glDisable(GL_LIGHTING)
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glRasterPos2i(cx, cy)
     glDrawPixels(sw, sh, GL_RGBA, GL_UNSIGNED_BYTE, data)
     glDisable(GL_BLEND); glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING)
     glMatrixMode(GL_PROJECTION); glPopMatrix()
@@ -578,7 +637,8 @@ def main():
     print(f"Protein: {pdb_id}  {pdb_title}")
 
     (ctx, integrator, prot_heavy, prot_elem,
-     water_o, ligand, prot_center, surface_data) = prepare(pdb_file)
+     water_o, ligand, prot_center, surface_data,
+     box_origin, box_lengths) = prepare(pdb_file)
 
     # ── Pygame + OpenGL ──
     pygame.init(); pygame.font.init()
@@ -601,6 +661,35 @@ def main():
     show_surface = True
     hi_score = 0
     frame = 0
+    paused = False
+    menu_sel = 0
+    pe, temp, contacts = 0.0, 300.0, 0
+
+    state = ctx.getState(getPositions=True)
+    pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+    lig_c = pos[ligand[0]]
+
+    # runtime-adjustable parameters
+    params = [
+        {"name": "Restraint K",  "key": "rst_k",   "val": float(RESTRAINT_K),
+         "min": 0, "max": 5000, "step": 50, "unit": "kJ/mol/nm2",
+         "apply": lambda v: ctx.setParameter("rst_k", v)},
+        {"name": "Force",        "key": "force",    "val": float(FORCE_MAG),
+         "min": 50, "max": 2000, "step": 50, "unit": "kJ/mol/nm",
+         "apply": None},
+        {"name": "Friction",     "key": "friction", "val": float(FRICTION),
+         "min": 0.5, "max": 20, "step": 0.5, "unit": "1/ps",
+         "apply": lambda v: integrator.setFriction(v / unit.picosecond)},
+        {"name": "Temperature",  "key": "temp",     "val": float(TEMPERATURE),
+         "min": 10, "max": 1000, "step": 10, "unit": "K",
+         "apply": lambda v: integrator.setTemperature(v * unit.kelvin)},
+        {"name": "MD steps",     "key": "mdsteps",  "val": float(MD_STEPS),
+         "min": 1, "max": 30, "step": 1, "unit": "/frame",
+         "apply": None},
+        {"name": "Water radius", "key": "wcut",     "val": float(WATER_VIS_CUT),
+         "min": 0.5, "max": 5.0, "step": 0.25, "unit": "nm",
+         "apply": None},
+    ]
 
     while True:
         # ── Events ──
@@ -609,68 +698,101 @@ def main():
                 pygame.quit(); return
             elif ev.type == KEYDOWN:
                 if ev.key == K_ESCAPE:
-                    pygame.quit(); return
+                    if paused:
+                        paused = False
+                        pygame.event.set_grab(True)
+                        pygame.mouse.set_visible(False)
+                    else:
+                        pygame.quit(); return
+                elif ev.key == K_p:
+                    paused = not paused
+                    pygame.event.set_grab(not paused)
+                    pygame.mouse.set_visible(paused)
+                elif paused:
+                    if ev.key == K_UP:
+                        menu_sel = (menu_sel - 1) % len(params)
+                    elif ev.key == K_DOWN:
+                        menu_sel = (menu_sel + 1) % len(params)
+                    elif ev.key in (K_RIGHT, K_EQUALS, K_PLUS):
+                        p = params[menu_sel]
+                        p["val"] = min(p["max"], p["val"] + p["step"])
+                        if p["apply"]:
+                            p["apply"](p["val"])
+                    elif ev.key in (K_LEFT, K_MINUS):
+                        p = params[menu_sel]
+                        p["val"] = max(p["min"], p["val"] - p["step"])
+                        if p["apply"]:
+                            p["apply"](p["val"])
                 elif ev.key == K_v:
                     show_surface = not show_surface
-            elif ev.type == MOUSEWHEEL:
+            elif ev.type == MOUSEWHEEL and not paused:
                 cam.zoom(ev.y)
 
-        mdx, mdy = pygame.mouse.get_rel()
-        cam.rotate(-mdx, mdy)
+        if not paused:
+            mdx, mdy = pygame.mouse.get_rel()
+            cam.rotate(-mdx, mdy)
 
-        # ── Input → force (camera-relative) ──
-        k = pygame.key.get_pressed()
-        kw = bool(k[K_w]); ks = bool(k[K_s])
-        ka = bool(k[K_a]); kd = bool(k[K_d])
-        ksp = bool(k[K_SPACE]); ksh = bool(k[K_LSHIFT] or k[K_RSHIFT])
-        active_keys = [kw, ka, ks, kd, ksp, ksh]
+            cur_force = params[1]["val"]
+            cur_mdsteps = int(params[4]["val"])
+            cur_wcut = params[5]["val"]
 
-        f = np.zeros(3)
-        if kw: f += cam.forward()
-        if ks: f -= cam.forward()
-        if kd: f += cam.right()
-        if ka: f -= cam.right()
-        if ksp: f[1] += 1
-        if ksh: f[1] -= 1
-        n = np.linalg.norm(f)
-        if n > 0:
-            f = f / n * FORCE_MAG
-        ctx.setParameter("fx", float(f[0]))
-        ctx.setParameter("fy", float(f[1]))
-        ctx.setParameter("fz", float(f[2]))
+            # ── Input → force (camera-relative) ──
+            k = pygame.key.get_pressed()
+            kw = bool(k[K_w]); ks = bool(k[K_s])
+            ka = bool(k[K_a]); kd = bool(k[K_d])
+            ksp = bool(k[K_SPACE]); ksh = bool(k[K_LSHIFT] or k[K_RSHIFT])
+            active_keys = [kw, ka, ks, kd, ksp, ksh]
 
-        # ── MD ──
-        integrator.step(MD_STEPS)
+            f = np.zeros(3)
+            if kw: f += cam.forward()
+            if ks: f -= cam.forward()
+            if kd: f += cam.right()
+            if ka: f -= cam.right()
+            if ksp: f[1] += 1
+            if ksh: f[1] -= 1
+            fn = np.linalg.norm(f)
+            if fn > 0:
+                f = f / fn * cur_force
+            ctx.setParameter("fx", float(f[0]))
+            ctx.setParameter("fy", float(f[1]))
+            ctx.setParameter("fz", float(f[2]))
 
-        # ── State ──
-        state = ctx.getState(getPositions=True, getEnergy=True)
-        pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-        pe = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        ke = state.getKineticEnergy().value_in_unit(unit.kilojoules_per_mole)
-        temp = 2 * ke / (3 * len(pos) * 8.314e-3)
+            integrator.step(cur_mdsteps)
 
-        lig_c = pos[ligand[0]]
-        cam.track(lig_c)
+            state = ctx.getState(getPositions=True, getEnergy=True)
+            pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            pe = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+            ke = state.getKineticEnergy().value_in_unit(unit.kilojoules_per_mole)
+            temp = 2 * ke / (3 * len(pos) * 8.314e-3)
 
-        dists = np.linalg.norm(pos[prot_heavy] - lig_c, axis=1)
-        contacts = int(np.sum(dists < CONTACT_CUT))
-        hi_score = max(hi_score, contacts)
+            lig_c = pos[ligand[0]]
+            cam.track(lig_c + np.array([0, 0.6, 0]))
 
-        # ── Render ──
+            dists = np.linalg.norm(pos[prot_heavy] - lig_c, axis=1)
+            contacts = int(np.sum(dists < CONTACT_CUT))
+            hi_score = max(hi_score, contacts)
+        else:
+            active_keys = [False] * 6
+            pygame.mouse.get_rel()
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         cam.apply()
 
-        draw_grid(prot_center)
+        draw_grid(box_origin, box_lengths)
+        draw_box(box_origin, box_lengths)
         if show_surface:
             draw_protein_surface()
         else:
             draw_protein_atoms(pos, prot_heavy, prot_elem)
-        draw_water(pos, water_o)
+        draw_water(pos, water_o, lig_c)
         draw_ligand(pos, ligand)
         draw_axes(aw, ah, cam)
-        draw_scanlines(aw, ah)
+        draw_crosshair(aw, ah)
         draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
                  hi_score, clock.get_fps(), active_keys, show_surface, frame)
+
+        if paused:
+            draw_pause_menu(aw, ah, params, menu_sel)
 
         pygame.display.flip()
         clock.tick(FPS_CAP)
