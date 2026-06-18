@@ -180,7 +180,14 @@ def prepare(pdb_path):
                     ca_idx.append(atom.index)
         print(f"     Removed {len(to_delete)} water molecules")
 
-    print(f"     Protein heavy atoms: {len(prot_heavy)},  Water: {len(water_o)}")
+    heavy_set = set(prot_heavy)
+    heavy_bonds = []
+    for bond in modeller.topology.bonds():
+        a, b = bond[0].index, bond[1].index
+        if a in heavy_set and b in heavy_set:
+            heavy_bonds.append((a, b))
+
+    print(f"     Protein heavy atoms: {len(prot_heavy)},  Bonds: {len(heavy_bonds)},  Water: {len(water_o)}")
 
     print("[4/6] Building force field …")
     system = ff.createSystem(
@@ -233,7 +240,7 @@ def prepare(pdb_path):
     return (ctx, integrator,
             np.array(prot_heavy), np.array(prot_elem),
             np.array(water_o), ligand, prot_center, surface_data,
-            box_origin, np.diag(box))
+            box_origin, np.diag(box), heavy_bonds)
 
 
 # ── Camera ──────────────────────────────────────────────────
@@ -320,6 +327,23 @@ def draw_protein_atoms(pos, prot_heavy, prot_elem):
             glScalef(r, r, r)
             glCallList(_sdl)
             glPopMatrix()
+
+
+def draw_protein_sticks(pos, bond_a, bond_b, bond_colors):
+    n = len(bond_a)
+    verts = np.empty((n * 2, 3), dtype=np.float32)
+    verts[0::2] = pos[bond_a]
+    verts[1::2] = pos[bond_b]
+    glDisable(GL_LIGHTING)
+    glLineWidth(2.0)
+    glEnableClientState(GL_VERTEX_ARRAY)
+    glEnableClientState(GL_COLOR_ARRAY)
+    glVertexPointer(3, GL_FLOAT, 0, verts)
+    glColorPointer(3, GL_FLOAT, 0, bond_colors)
+    glDrawArrays(GL_LINES, 0, n * 2)
+    glDisableClientState(GL_VERTEX_ARRAY)
+    glDisableClientState(GL_COLOR_ARRAY)
+    glEnable(GL_LIGHTING)
 
 
 def draw_protein_surface():
@@ -469,7 +493,7 @@ def draw_scanlines(aw, ah):
 
 # ── HUD ────────────────────────────────────────────────────
 def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
-             hi_score, fps, active_keys, show_surface, frame):
+             hi_score, fps, active_keys, view_name, frame):
     pad = 8
     lh = 20
     bw = 310
@@ -524,7 +548,7 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
     y += lh - 4
     surf.blit(_txt(f"Temp {temp:5.0f}K  FPS {fps:3.0f}", PX["dim"], big=False), (pad, y))
     y += lh - 4
-    vn = "Surface" if show_surface else "Spheres"
+    vn = view_name
     surf.blit(_txt(f"View: {vn} [V]", PX["dim"], big=False), (pad, y))
     y += lh - 2
 
@@ -638,7 +662,14 @@ def main():
 
     (ctx, integrator, prot_heavy, prot_elem,
      water_o, ligand, prot_center, surface_data,
-     box_origin, box_lengths) = prepare(pdb_file)
+     box_origin, box_lengths, heavy_bonds) = prepare(pdb_file)
+    elem_map = {int(i): str(e) for i, e in zip(prot_heavy, prot_elem)}
+    bond_a = np.array([a for a, b in heavy_bonds], dtype=np.int32)
+    bond_b = np.array([b for a, b in heavy_bonds], dtype=np.int32)
+    bond_colors = np.empty((len(heavy_bonds) * 2, 3), dtype=np.float32)
+    for i, (a, b) in enumerate(heavy_bonds):
+        bond_colors[i * 2] = CPK.get(elem_map[a], (0.35, 0.35, 0.35))
+        bond_colors[i * 2 + 1] = CPK.get(elem_map[b], (0.35, 0.35, 0.35))
 
     # ── Pygame + OpenGL ──
     pygame.init(); pygame.font.init()
@@ -658,7 +689,8 @@ def main():
 
     cam = Camera()
     cam.target = prot_center.copy()
-    show_surface = True
+    VIEW_NAMES = ["Sticks", "Surface", "Spheres"]
+    view_mode = 0
     hi_score = 0
     frame = 0
     paused = False
@@ -724,7 +756,7 @@ def main():
                         if p["apply"]:
                             p["apply"](p["val"])
                 elif ev.key == K_v:
-                    show_surface = not show_surface
+                    view_mode = (view_mode + 1) % len(VIEW_NAMES)
             elif ev.type == MOUSEWHEEL and not paused:
                 cam.zoom(ev.y)
 
@@ -780,7 +812,9 @@ def main():
 
         draw_grid(box_origin, box_lengths)
         draw_box(box_origin, box_lengths)
-        if show_surface:
+        if view_mode == 0:
+            draw_protein_sticks(pos, bond_a, bond_b, bond_colors)
+        elif view_mode == 1:
             draw_protein_surface()
         else:
             draw_protein_atoms(pos, prot_heavy, prot_elem)
@@ -789,7 +823,7 @@ def main():
         draw_axes(aw, ah, cam)
         draw_crosshair(aw, ah)
         draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
-                 hi_score, clock.get_fps(), active_keys, show_surface, frame)
+                 hi_score, clock.get_fps(), active_keys, VIEW_NAMES[view_mode], frame)
 
         if paused:
             draw_pause_menu(aw, ah, params, menu_sel)
