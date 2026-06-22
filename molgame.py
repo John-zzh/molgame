@@ -26,6 +26,8 @@ FORCE_MAG       = 500.0
 FRICTION        = 5.0
 MOUSE_SENS      = 0.15
 SCROLL_SENS     = 0.5
+PAD_LOOK_SENS   = 3.0
+PAD_DEADZONE    = 0.15
 TEMPERATURE     = 300.0
 RESTRAINT_K     = 0.0
 CONTACT_CUT     = 0.5
@@ -573,7 +575,7 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
         kx += kw + 3
     y += box_h + 4
 
-    surf.blit(_txt("Mouse:look  Scroll:zoom  ESC:quit", PX["dim"], big=False),
+    surf.blit(_txt("Mouse:look  Scroll:zoom  P:pause", PX["dim"], big=False),
               (pad, y))
     y += 16
 
@@ -673,6 +675,7 @@ def main():
 
     # ── Pygame + OpenGL ──
     pygame.init(); pygame.font.init()
+    fullscreen = False
     screen = pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL)
     pygame.display.set_caption(f"MolGame — {pdb_id}")
     pygame.event.set_grab(True)
@@ -686,6 +689,35 @@ def main():
     verts, faces, normals = surface_data
     print(f"Surface mesh: {len(verts)} verts, {len(faces)} triangles")
     _surf_dl = build_surface_dl(verts, faces, normals)
+
+    # ── Gamepad ──
+    pygame.joystick.init()
+    pad = None
+    if pygame.joystick.get_count() > 0:
+        pad = pygame.joystick.Joystick(0)
+        pad.init()
+        print(f"Gamepad: {pad.get_name()}  axes={pad.get_numaxes()} buttons={pad.get_numbuttons()}")
+
+    def pad_axis(idx):
+        if pad is None or idx >= pad.get_numaxes():
+            return 0.0
+        v = pad.get_axis(idx)
+        return v if abs(v) > PAD_DEADZONE else 0.0
+
+    def toggle_fullscreen():
+        nonlocal fullscreen, aw, ah
+        global _surf_dl
+        fullscreen = not fullscreen
+        if fullscreen:
+            screen = pygame.display.set_mode((0, 0), DOUBLEBUF | OPENGL | FULLSCREEN)
+        else:
+            screen = pygame.display.set_mode((W, H), DOUBLEBUF | OPENGL)
+        vp = glGetIntegerv(GL_VIEWPORT)
+        aw, ah = int(vp[2]), int(vp[3])
+        gl_init(aw, ah)
+        _surf_dl = build_surface_dl(*surface_data)
+        pygame.event.set_grab(True)
+        pygame.mouse.set_visible(False)
 
     cam = Camera()
     cam.target = prot_center.copy()
@@ -757,23 +789,83 @@ def main():
                             p["apply"](p["val"])
                 elif ev.key == K_v:
                     view_mode = (view_mode + 1) % len(VIEW_NAMES)
+                elif ev.key == K_F11:
+                    toggle_fullscreen()
             elif ev.type == MOUSEWHEEL and not paused:
                 cam.zoom(ev.y)
+            elif ev.type == JOYBUTTONDOWN:
+                if ev.button == 0:  # A
+                    paused = not paused
+                    pygame.event.set_grab(not paused)
+                    pygame.mouse.set_visible(paused)
+                elif ev.button == 1 and not paused:  # B
+                    view_mode = (view_mode + 1) % len(VIEW_NAMES)
+                elif ev.button == 3 and not paused:  # Y
+                    toggle_fullscreen()
+                elif ev.button == 7:  # Start
+                    if paused:
+                        paused = False
+                        pygame.event.set_grab(True)
+                        pygame.mouse.set_visible(False)
+                    else:
+                        pygame.quit(); return
+                elif paused:
+                    if ev.button == 4:  # LB
+                        p = params[menu_sel]
+                        p["val"] = max(p["min"], p["val"] - p["step"])
+                        if p["apply"]: p["apply"](p["val"])
+                    elif ev.button == 5:  # RB
+                        p = params[menu_sel]
+                        p["val"] = min(p["max"], p["val"] + p["step"])
+                        if p["apply"]: p["apply"](p["val"])
+            elif ev.type == JOYHATMOTION and paused:
+                hx, hy = ev.value
+                if hy == 1:
+                    menu_sel = (menu_sel - 1) % len(params)
+                elif hy == -1:
+                    menu_sel = (menu_sel + 1) % len(params)
+                elif hx == 1:
+                    p = params[menu_sel]
+                    p["val"] = min(p["max"], p["val"] + p["step"])
+                    if p["apply"]: p["apply"](p["val"])
+                elif hx == -1:
+                    p = params[menu_sel]
+                    p["val"] = max(p["min"], p["val"] - p["step"])
+                    if p["apply"]: p["apply"](p["val"])
+            elif ev.type == JOYDEVICEADDED:
+                if pad is None:
+                    pad = pygame.joystick.Joystick(ev.device_index)
+                    pad.init()
+                    print(f"Gamepad connected: {pad.get_name()}")
+            elif ev.type == JOYDEVICEREMOVED:
+                pad = None
+                print("Gamepad disconnected")
 
         if not paused:
             mdx, mdy = pygame.mouse.get_rel()
             cam.rotate(-mdx, mdy)
 
+            # gamepad right stick → camera
+            cam.rotate(-pad_axis(2) * PAD_LOOK_SENS, pad_axis(3) * PAD_LOOK_SENS)
+            # gamepad bumpers → zoom
+            if pad and pad.get_numbuttons() > 5:
+                if pad.get_button(4): cam.zoom(1)
+                if pad.get_button(5): cam.zoom(-1)
+
             cur_force = params[1]["val"]
             cur_mdsteps = int(params[4]["val"])
             cur_wcut = params[5]["val"]
 
-            # ── Input → force (camera-relative) ──
+            # ── Input → force (keyboard + gamepad left stick + triggers) ──
             k = pygame.key.get_pressed()
             kw = bool(k[K_w]); ks = bool(k[K_s])
             ka = bool(k[K_a]); kd = bool(k[K_d])
             ksp = bool(k[K_SPACE]); ksh = bool(k[K_LSHIFT] or k[K_RSHIFT])
             active_keys = [kw, ka, ks, kd, ksp, ksh]
+
+            lx, ly = pad_axis(0), pad_axis(1)
+            lt = (pad_axis(4) + 1) * 0.5  # normalize -1..1 → 0..1
+            rt = (pad_axis(5) + 1) * 0.5
 
             f = np.zeros(3)
             if kw: f += cam.forward()
@@ -782,6 +874,9 @@ def main():
             if ka: f -= cam.right()
             if ksp: f[1] += 1
             if ksh: f[1] -= 1
+            f -= cam.forward() * ly  # stick Y: up = forward
+            f += cam.right() * lx
+            f[1] += rt - lt  # RT = up, LT = down
             fn = np.linalg.norm(f)
             if fn > 0:
                 f = f / fn * cur_force
