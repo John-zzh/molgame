@@ -3,9 +3,10 @@
 MolGame — Pixel Edition
 Real protein MD + retro pixel-art HUD.  WASD steer, mouse look, scroll zoom.
 Usage:  python molgame.py [--pdb 1UBQ]
+        python molgame.py [--pdb 4HJO --ligand ZMA]
 """
 
-import sys, math, os, time, argparse, json
+import sys, math, os, time, argparse, json, tempfile
 import numpy as np
 import pygame
 from pygame.locals import *
@@ -61,8 +62,9 @@ def save_config(cfg):
         print(f"Warning: could not save config: {e}")
 
 CPK = {"C": (0.32, 0.32, 0.32), "N": (0.14, 0.20, 0.65),
-       "O": (0.65, 0.14, 0.14), "S": (0.65, 0.60, 0.14)}
-VDW_RENDER = {"C": 0.09, "N": 0.08, "O": 0.08, "S": 0.10}
+       "O": (0.65, 0.14, 0.14), "S": (0.65, 0.60, 0.14),
+       "H": (0.85, 0.85, 0.85)}
+VDW_RENDER = {"C": 0.09, "N": 0.08, "O": 0.08, "S": 0.10, "H": 0.05}
 VDW_REAL   = {"C": 0.170, "N": 0.155, "O": 0.152, "S": 0.180}
 
 # ── Pixel palette (Contra / NES inspired) ──────────────────
@@ -88,7 +90,7 @@ PX = {
 
 
 # ── Molecular Surface (marching cubes) ─────────────────────
-def compute_surface(atom_pos, elem_list, probe_r=0.14, spacing=0.08):
+def compute_surface(atom_pos, elem_list, probe_r=0.14, spacing=0.12):
     from skimage.measure import marching_cubes
     radii = np.array([VDW_REAL.get(e, 0.15) + probe_r for e in elem_list])
     margin = 0.3
@@ -147,79 +149,179 @@ def read_pdb_title(path):
     return title[:32] + ".." if len(title) > 34 else title
 
 
+# ── Ligand extraction ──────────────────────────────────────
+def extract_ligand(pdb_path, lig_name):
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    lines = []
+    with open(pdb_path) as f:
+        for line in f:
+            if line.startswith(("HETATM", "ATOM")) and line[17:20].strip() == lig_name:
+                lines.append(line)
+    if not lines:
+        print(f"ERROR: Ligand '{lig_name}' not found in {pdb_path}")
+        sys.exit(1)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdb", mode="w", delete=False)
+    for line in lines:
+        tmp.write(line)
+    tmp.write("END\n")
+    tmp.close()
+
+    mol = Chem.MolFromPDBFile(tmp.name, removeHs=False, sanitize=False)
+    os.unlink(tmp.name)
+    if mol is None:
+        print(f"ERROR: RDKit could not parse ligand '{lig_name}'")
+        sys.exit(1)
+
+    try:
+        Chem.SanitizeMol(mol)
+    except Exception:
+        pass
+    mol = Chem.AddHs(mol, addCoords=True)
+    print(f"     Ligand {lig_name}: {mol.GetNumHeavyAtoms()} heavy + "
+          f"{mol.GetNumAtoms() - mol.GetNumHeavyAtoms()} H = {mol.GetNumAtoms()} atoms")
+    return mol
+
+
 # ── Prepare molecular system ───────────────────────────────
-def prepare(pdb_path, cfg):
+def prepare(pdb_path, cfg, lig_name=None):
     t0 = time.time()
-    print("[1/6] Fixing PDB …")
+    step, nsteps = 0, 8 if lig_name else 7
+
+    # ── Extract & parameterize ligand ──
+    if lig_name:
+        step += 1
+        print(f"[{step}/{nsteps}] Preparing ligand {lig_name} (GAFF2) …")
+        from openff.toolkit import Molecule as OFFMolecule
+        from openmmforcefields.generators import GAFFTemplateGenerator
+
+        rdkit_mol = extract_ligand(pdb_path, lig_name)
+        off_mol = OFFMolecule.from_rdkit(rdkit_mol, allow_undefined_stereo=True)
+        cache_path = os.path.join(os.path.dirname(os.path.abspath(pdb_path)),
+                                  "gaff_cache.json")
+        gaff = GAFFTemplateGenerator(molecules=off_mol, forcefield="gaff-2.11",
+                                     cache=cache_path)
+        lig_top = off_mol.to_topology().to_openmm()
+        lig_pos_q = off_mol.conformers[0].to_openmm()
+        lig_pos_nm = np.array(lig_pos_q.value_in_unit(unit.nanometers))
+        lig_center = lig_pos_nm.mean(axis=0)
+
+    # ── Fix protein ──
+    step += 1
+    print(f"[{step}/{nsteps}] Fixing PDB …")
     fixer = PDBFixer(filename=pdb_path)
     fixer.removeHeterogens(False)
     fixer.findMissingResidues()
+    fixer.missingResidues = {}
     fixer.findNonstandardResidues()
     fixer.replaceNonstandardResidues()
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
     fixer.addMissingHydrogens(7.0)
 
-    print("[2/6] Solvating with TIP3P …")
+    # ── ForceField ──
     ff = app.ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
-    modeller = app.Modeller(fixer.topology, fixer.positions)
-    modeller.addSolvent(ff, model="tip3p", padding=0.8 * unit.nanometers)
+    if lig_name:
+        ff.registerTemplateGenerator(gaff.generator)
 
-    prot_heavy, prot_elem, water_o, ca_idx = [], [], [], []
+    # ── Solvate (protein only at this point) ──
+    step += 1
+    print(f"[{step}/{nsteps}] Solvating with TIP3P …")
+    modeller = app.Modeller(fixer.topology, fixer.positions)
+    modeller.addSolvent(ff, model="tip3p", padding=0.8 * unit.nanometers,
+                        ionicStrength=0.15 * unit.molar)
+
+    pos = np.array(modeller.positions.value_in_unit(unit.nanometers))
+
+    if not lig_name:
+        prot_idx_tmp = [a.index for a in modeller.topology.atoms()
+                        if a.residue.name not in ("HOH", "WAT")]
+        prot_pos = pos[prot_idx_tmp]
+        prot_center = prot_pos.mean(axis=0)
+        dx = prot_pos[:, 0] - prot_center[0]
+        surf = prot_pos[np.argmax(dx)]
+        direction = surf - prot_center
+        direction /= np.linalg.norm(direction)
+        lig_center = surf + direction * 1.0
+
+    # ── Clear water overlap at ligand site ──
+    step += 1
+    print(f"[{step}/{nsteps}] Clearing water overlap …")
+    to_delete = []
+    if lig_name:
+        for res in modeller.topology.residues():
+            if res.name in ("HOH", "WAT"):
+                for atom in res.atoms():
+                    if atom.element.symbol == "O":
+                        d = np.min(np.linalg.norm(lig_pos_nm - pos[atom.index], axis=1))
+                        if d < 0.25:
+                            to_delete.append(res)
+                        break
+    else:
+        for res in modeller.topology.residues():
+            if res.name in ("HOH", "WAT"):
+                for atom in res.atoms():
+                    if atom.element.symbol == "O":
+                        if np.linalg.norm(pos[atom.index] - lig_center) < 0.4:
+                            to_delete.append(res)
+                        break
+    if to_delete:
+        modeller.delete(to_delete)
+        print(f"     Removed {len(to_delete)} water molecules")
+
+    # ── Add ligand AFTER water deletion so indices are stable ──
+    if lig_name:
+        step += 1
+        print(f"[{step}/{nsteps}] Adding ligand to topology …")
+        n_before_lig = sum(1 for _ in modeller.topology.atoms())
+        modeller.add(lig_top, lig_pos_q)
+        n_lig_atoms = off_mol.n_atoms
+        lig_set = set(range(n_before_lig, n_before_lig + n_lig_atoms))
+
+    # ── Collect atom indices ──
+    pos = np.array(modeller.positions.value_in_unit(unit.nanometers))
+    prot_idx, prot_elem, water_o, ca_idx = [], [], [], []
+    lig_indices, lig_elem = [], []
     for atom in modeller.topology.atoms():
         if atom.residue.name in ("HOH", "WAT"):
             if atom.element.symbol == "O":
                 water_o.append(atom.index)
-        elif atom.element.symbol != "H":
-            prot_heavy.append(atom.index)
+        elif lig_name and atom.index in lig_set:
+            lig_indices.append(atom.index)
+            lig_elem.append(atom.element.symbol)
+        else:
+            prot_idx.append(atom.index)
             prot_elem.append(atom.element.symbol)
             if atom.name == "CA":
                 ca_idx.append(atom.index)
 
-    pos = np.array(modeller.positions.value_in_unit(unit.nanometers))
-    prot_pos = pos[prot_heavy]
-    prot_center = prot_pos.mean(axis=0)
+    prot_center = pos[prot_idx].mean(axis=0) if prot_idx else pos.mean(axis=0)
 
-    dx = prot_pos[:, 0] - prot_center[0]
-    surf = prot_pos[np.argmax(dx)]
-    direction = surf - prot_center
-    direction /= np.linalg.norm(direction)
-    lig_center = surf + direction * 1.0
-
-    print("[3/6] Clearing water overlap …")
-    to_delete = []
-    for res in modeller.topology.residues():
-        if res.name in ("HOH", "WAT"):
-            for atom in res.atoms():
-                if atom.element.symbol == "O":
-                    if np.linalg.norm(pos[atom.index] - lig_center) < 0.4:
-                        to_delete.append(res)
-                    break
-    if to_delete:
-        modeller.delete(to_delete)
-        pos = np.array(modeller.positions.value_in_unit(unit.nanometers))
-        prot_heavy, prot_elem, water_o, ca_idx = [], [], [], []
-        for atom in modeller.topology.atoms():
-            if atom.residue.name in ("HOH", "WAT"):
-                if atom.element.symbol == "O":
-                    water_o.append(atom.index)
-            elif atom.element.symbol != "H":
-                prot_heavy.append(atom.index)
-                prot_elem.append(atom.element.symbol)
-                if atom.name == "CA":
-                    ca_idx.append(atom.index)
-        print(f"     Removed {len(to_delete)} water molecules")
-
-    heavy_set = set(prot_heavy)
-    heavy_bonds = []
+    # ── Bonds (protein + ligand separately) ──
+    prot_set = set(prot_idx)
+    prot_bonds = []
+    lig_bonds = []
     for bond in modeller.topology.bonds():
         a, b = bond[0].index, bond[1].index
-        if a in heavy_set and b in heavy_set:
-            heavy_bonds.append((a, b))
+        if lig_name and a in lig_set and b in lig_set:
+            lig_bonds.append((a, b))
+        elif a in prot_set and b in prot_set:
+            prot_bonds.append((a, b))
 
-    print(f"     Protein heavy atoms: {len(prot_heavy)},  Bonds: {len(heavy_bonds)},  Water: {len(water_o)}")
+    if lig_name:
+        print(f"     Protein atoms: {len(prot_idx)},  Ligand atoms: {len(lig_indices)},  "
+              f"Bonds: {len(prot_bonds)}+{len(lig_bonds)},  Water: {len(water_o)}")
+    else:
+        print(f"     Protein atoms: {len(prot_idx)},  Bonds: {len(prot_bonds)},  Water: {len(water_o)}")
 
-    print("[4/6] Building force field …")
+    # ── Build system ──
+    step += 1
+    if lig_name:
+        print(f"[{step}/{nsteps}] Building force field (GAFF2 AM1-BCC, may take ~60s) …")
+    else:
+        print(f"[{step}/{nsteps}] Building force field …")
     system = ff.createSystem(
         modeller.topology, nonbondedMethod=app.PME,
         nonbondedCutoff=0.9 * unit.nanometers, constraints=app.HBonds)
@@ -233,32 +335,66 @@ def prepare(pdb_path, cfg):
         rst.addParticle(idx, pos[idx].tolist())
     system.addForce(rst)
 
-    lig_idx = system.addParticle(40.0)
-    nb = next(f for f in system.getForces() if isinstance(f, mm.NonbondedForce))
-    nb.addParticle(0.0, 0.40, 6.0)
-
-    pf = mm.CustomExternalForce("-(fx*x + fy*y + fz*z)")
+    # ── Steering force (per-particle active flag for target switching) ──
+    pf = mm.CustomExternalForce("active * -(fx*x + fy*y + fz*z)")
     pf.addGlobalParameter("fx", 0.0)
     pf.addGlobalParameter("fy", 0.0)
     pf.addGlobalParameter("fz", 0.0)
-    pf.addParticle(lig_idx, [])
+    pf.addPerParticleParameter("active")
+
+    pf_map = {}
+    for idx in prot_idx:
+        pf_map[idx] = pf.addParticle(idx, [0.0])
+
+    if lig_name:
+        for idx in lig_indices:
+            pf_map[idx] = pf.addParticle(idx, [1.0])
+        ligand = np.array(lig_indices)
+        all_pos = pos
+    else:
+        lig_idx = system.addParticle(40.0)
+        nb = next(f for f in system.getForces() if isinstance(f, mm.NonbondedForce))
+        nb.addParticle(0.0, 0.40, 6.0)
+        pf_map[lig_idx] = pf.addParticle(lig_idx, [1.0])
+        all_pos = np.vstack([pos, [lig_center]])
+        ligand = np.array([lig_idx])
+        lig_elem = []
+        lig_bonds = []
     system.addForce(pf)
 
-    all_pos = np.vstack([pos, [lig_center]])
-    ligand = np.array([lig_idx])
+    # ── Residue mapping (for X-key target switching) ──
+    res_atoms = {}
+    for atom in modeller.topology.atoms():
+        if atom.residue.name in ("HOH", "WAT"):
+            continue
+        if lig_name and atom.index in lig_set:
+            continue
+        rkey = (atom.residue.chain.index, atom.residue.id)
+        if rkey not in res_atoms:
+            res_atoms[rkey] = []
+        res_atoms[rkey].append(atom.index)
+
     print(f"     Total particles: {system.getNumParticles()}")
 
-    print("[5/6] Computing molecular surface …")
-    surface_data = compute_surface(pos[prot_heavy], prot_elem)
+    # ── Molecular surface (protein heavy atoms only) ──
+    step += 1
+    print(f"[{step}/{nsteps}] Computing molecular surface …")
+    heavy_mask = np.array([e != "H" for e in prot_elem])
+    heavy_pos = pos[np.array(prot_idx)[heavy_mask]]
+    heavy_elem = [e for e in prot_elem if e != "H"]
+    surface_data = compute_surface(heavy_pos, heavy_elem)
 
-    print("[6/6] Creating simulation (OpenCL) …")
+    # ── Simulation ──
+    step += 1
+    print(f"[{step}/{nsteps}] Creating simulation (OpenCL) …")
     integrator = mm.LangevinMiddleIntegrator(
         cfg["temperature"] * unit.kelvin, cfg["friction"] / unit.picosecond, DT * unit.picoseconds)
     platform = mm.Platform.getPlatformByName("OpenCL")
     ctx = mm.Context(system, integrator, platform)
     ctx.setPositions(all_pos * unit.nanometers)
     print("      Minimising …")
-    mm.LocalEnergyMinimizer.minimize(ctx, tolerance=10.0, maxIterations=500)
+    max_iter = 2000 if lig_name else 500
+    mm.LocalEnergyMinimizer.minimize(ctx, tolerance=10.0, maxIterations=max_iter)
     ctx.setVelocitiesToTemperature(cfg["temperature"] * unit.kelvin)
     print("      Equilibrating …")
     integrator.step(500)
@@ -268,9 +404,24 @@ def prepare(pdb_path, cfg):
     print(f"      Box: {box[0][0]:.2f} x {box[1][1]:.2f} x {box[2][2]:.2f} nm")
     print(f"      Ready in {time.time()-t0:.1f}s\n")
     return (ctx, integrator,
-            np.array(prot_heavy), np.array(prot_elem),
+            np.array(prot_idx), np.array(prot_elem),
             np.array(water_o), ligand, prot_center, surface_data,
-            box_origin, np.diag(box), heavy_bonds)
+            box_origin, np.diag(box), prot_bonds,
+            np.array(lig_elem), lig_bonds,
+            pf, pf_map, res_atoms)
+
+
+# ── Rotation helper ────────────────────────────────────────
+def rotation_matrix(axis, angle_deg):
+    a = math.radians(angle_deg)
+    c, s = math.cos(a), math.sin(a)
+    ax = axis / np.linalg.norm(axis)
+    x, y, z = ax
+    return np.array([
+        [c + x*x*(1-c),   x*y*(1-c) - z*s, x*z*(1-c) + y*s],
+        [y*x*(1-c) + z*s, c + y*y*(1-c),   y*z*(1-c) - x*s],
+        [z*x*(1-c) - y*s, z*y*(1-c) + x*s, c + z*z*(1-c)]
+    ])
 
 
 # ── Camera ──────────────────────────────────────────────────
@@ -342,9 +493,9 @@ def gl_init(aw, ah):
     glNewList(_sdl, GL_COMPILE); gluSphere(_quad, 1.0, 10, 5); glEndList()
 
 
-def draw_protein_atoms(pos, prot_heavy, prot_elem):
+def draw_protein_atoms(pos, prot_idx, prot_elem):
     by_elem = {}
-    for idx, el in zip(prot_heavy, prot_elem):
+    for idx, el in zip(prot_idx, prot_elem):
         by_elem.setdefault(el, []).append(idx)
     for el, indices in by_elem.items():
         col = CPK.get(el, (0.35, 0.35, 0.35))
@@ -398,21 +549,50 @@ def draw_water(pos, water_o, lig_pos, wcut):
     glDisable(GL_BLEND); glEnable(GL_LIGHTING)
 
 
-def draw_ligand(pos, lig):
-    p = pos[lig[0]]
-    glPushMatrix()
-    glTranslatef(float(p[0]), float(p[1]), float(p[2]))
-    glColor3f(0.15, 0.95, 0.30)
-    gluSphere(_quad, 0.18, 16, 8)
-    glPopMatrix()
-    glDisable(GL_LIGHTING)
-    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-    glColor4f(0.3, 1.0, 0.5, 0.3)
-    glPushMatrix()
-    glTranslatef(float(p[0]), float(p[1]), float(p[2]))
-    gluSphere(_quad, 0.25, 12, 6)
-    glPopMatrix()
-    glDisable(GL_BLEND); glEnable(GL_LIGHTING)
+def draw_ligand(pos, lig, lig_elem=None, lig_bond_a=None, lig_bond_b=None,
+                lig_bond_colors=None):
+    if len(lig) == 1:
+        p = pos[lig[0]]
+        glPushMatrix()
+        glTranslatef(float(p[0]), float(p[1]), float(p[2]))
+        glColor3f(0.15, 0.95, 0.30)
+        gluSphere(_quad, 0.18, 16, 8)
+        glPopMatrix()
+        glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glColor4f(0.3, 1.0, 0.5, 0.3)
+        glPushMatrix()
+        glTranslatef(float(p[0]), float(p[1]), float(p[2]))
+        gluSphere(_quad, 0.25, 12, 6)
+        glPopMatrix()
+        glDisable(GL_BLEND); glEnable(GL_LIGHTING)
+    else:
+        if lig_bond_a is not None and len(lig_bond_a) > 0:
+            draw_protein_sticks(pos, lig_bond_a, lig_bond_b, lig_bond_colors)
+        LIG_CPK = {"C": (0.15, 0.75, 0.35), "N": (0.20, 0.40, 0.90),
+                   "O": (0.90, 0.25, 0.25), "S": (0.85, 0.75, 0.20),
+                   "H": (0.50, 0.90, 0.60), "F": (0.30, 0.90, 0.30),
+                   "Cl": (0.30, 0.90, 0.30), "Br": (0.60, 0.20, 0.10),
+                   "P": (0.75, 0.45, 0.10)}
+        for idx, el in zip(lig, lig_elem):
+            col = LIG_CPK.get(el, (0.15, 0.75, 0.35))
+            r = VDW_RENDER.get(el, 0.07) * 1.3
+            glColor3f(*col)
+            glPushMatrix()
+            p = pos[idx]
+            glTranslatef(float(p[0]), float(p[1]), float(p[2]))
+            glScalef(r, r, r)
+            glCallList(_sdl)
+            glPopMatrix()
+        center = pos[lig].mean(axis=0)
+        glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glColor4f(0.2, 1.0, 0.4, 0.10)
+        glPushMatrix()
+        glTranslatef(float(center[0]), float(center[1]), float(center[2]))
+        gluSphere(_quad, 0.5, 16, 8)
+        glPopMatrix()
+        glDisable(GL_BLEND); glEnable(GL_LIGHTING)
 
 
 def draw_grid(origin, lengths, step=0.5):
@@ -607,6 +787,7 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
     help_lines = [
         "Mouse/RStick:look  Scroll/LB,RB:zoom",
         "WASD/LStick:move   SPC/RT:up  SHF/LT:dn",
+        "Arrows/D-pad:rotate  X:select residue",
         "V/B:view  P/A:pause  F11/Y:fullscreen",
         "ESC/Start:quit",
     ]
@@ -686,8 +867,11 @@ def main():
 
     parser = argparse.ArgumentParser(description="MolGame — Molecular Dynamics Game")
     parser.add_argument("--pdb", default="1UBQ", help="PDB ID (default: 1UBQ)")
+    parser.add_argument("--ligand", default=None,
+                        help="Ligand residue name in PDB (e.g. ZMA, ATP)")
     args = parser.parse_args()
     pdb_id = args.pdb.upper()
+    lig_name = args.ligand.upper() if args.ligand else None
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     pdb_file = os.path.join(base_dir, f"{pdb_id.lower()}.pdb")
@@ -699,16 +883,56 @@ def main():
 
     cfg = load_config()
 
-    (ctx, integrator, prot_heavy, prot_elem,
+    (ctx, integrator, prot_idx, prot_elem,
      water_o, ligand, prot_center, surface_data,
-     box_origin, box_lengths, heavy_bonds) = prepare(pdb_file, cfg)
-    elem_map = {int(i): str(e) for i, e in zip(prot_heavy, prot_elem)}
-    bond_a = np.array([a for a, b in heavy_bonds], dtype=np.int32)
-    bond_b = np.array([b for a, b in heavy_bonds], dtype=np.int32)
-    bond_colors = np.empty((len(heavy_bonds) * 2, 3), dtype=np.float32)
-    for i, (a, b) in enumerate(heavy_bonds):
+     box_origin, box_lengths, prot_bonds,
+     lig_elem, lig_bonds,
+     steer_force, steer_map, res_atoms) = prepare(pdb_file, cfg, lig_name)
+    has_real_ligand = lig_name is not None
+
+    current_target = ligand.copy()
+    controlling_residue = False
+    atom_to_res = {}
+    for rkey, indices in res_atoms.items():
+        for idx in indices:
+            atom_to_res[idx] = rkey
+
+    def switch_target(new_target):
+        nonlocal current_target
+        for idx in current_target:
+            if idx in steer_map:
+                steer_force.setParticleParameters(steer_map[idx], idx, [0.0])
+        for idx in new_target:
+            if idx in steer_map:
+                steer_force.setParticleParameters(steer_map[idx], idx, [1.0])
+        steer_force.updateParametersInContext(ctx)
+        current_target = np.array(new_target)
+
+    elem_map = {int(i): str(e) for i, e in zip(prot_idx, prot_elem)}
+    if has_real_ligand:
+        for i, e in zip(ligand, lig_elem):
+            elem_map[int(i)] = str(e)
+    bond_a = np.array([a for a, b in prot_bonds], dtype=np.int32)
+    bond_b = np.array([b for a, b in prot_bonds], dtype=np.int32)
+    bond_colors = np.empty((len(prot_bonds) * 2, 3), dtype=np.float32)
+    for i, (a, b) in enumerate(prot_bonds):
         bond_colors[i * 2] = CPK.get(elem_map[a], (0.35, 0.35, 0.35))
         bond_colors[i * 2 + 1] = CPK.get(elem_map[b], (0.35, 0.35, 0.35))
+
+    if has_real_ligand and len(lig_bonds) > 0:
+        lig_bond_a = np.array([a for a, b in lig_bonds], dtype=np.int32)
+        lig_bond_b = np.array([b for a, b in lig_bonds], dtype=np.int32)
+        lig_bond_colors = np.empty((len(lig_bonds) * 2, 3), dtype=np.float32)
+        LIG_CPK = {"C": (0.15, 0.75, 0.35), "N": (0.20, 0.40, 0.90),
+                   "O": (0.90, 0.25, 0.25), "S": (0.85, 0.75, 0.20),
+                   "H": (0.50, 0.90, 0.60), "F": (0.30, 0.90, 0.30),
+                   "Cl": (0.30, 0.90, 0.30), "Br": (0.60, 0.20, 0.10),
+                   "P": (0.75, 0.45, 0.10)}
+        for i, (a, b) in enumerate(lig_bonds):
+            lig_bond_colors[i * 2] = LIG_CPK.get(elem_map.get(a, "C"), (0.15, 0.75, 0.35))
+            lig_bond_colors[i * 2 + 1] = LIG_CPK.get(elem_map.get(b, "C"), (0.15, 0.75, 0.35))
+    else:
+        lig_bond_a, lig_bond_b, lig_bond_colors = None, None, None
 
     # ── Pygame + OpenGL ──
     pygame.init(); pygame.font.init()
@@ -768,7 +992,7 @@ def main():
 
     state = ctx.getState(getPositions=True)
     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-    lig_c = pos[ligand[0]]
+    lig_c = pos[ligand].mean(axis=0) if len(ligand) > 1 else pos[ligand[0]]
     cur_wcut = cfg["water_radius"]
 
     # runtime-adjustable parameters (synced with cfg on save)
@@ -777,7 +1001,8 @@ def main():
          "min": 0, "max": 5000, "step": 50, "unit": "kJ/mol/nm2",
          "apply": lambda v: ctx.setParameter("rst_k", v)},
         {"name": "Force",         "cfg": "force",       "val": cfg["force"],
-         "min": 50, "max": 2000, "step": 50, "unit": "kJ/mol/nm",
+         "min": 50, "max": 50000 if has_real_ligand else 2000,
+         "step": 500 if has_real_ligand else 50, "unit": "kJ/mol/nm",
          "apply": None},
         {"name": "Friction",      "cfg": "friction",    "val": cfg["friction"],
          "min": 0.5, "max": 20, "step": 0.5, "unit": "1/ps",
@@ -812,6 +1037,7 @@ def main():
 
     while True:
         # ── Events ──
+        do_select = False
         for ev in pygame.event.get():
             if ev.type == QUIT:
                 sync_cfg(); pygame.quit(); return
@@ -849,6 +1075,8 @@ def main():
                     view_mode = (view_mode + 1) % len(VIEW_NAMES)
                 elif ev.key == K_F11:
                     toggle_fullscreen()
+                elif ev.key == K_x:
+                    do_select = True
             elif ev.type == MOUSEWHEEL and not paused:
                 cam.zoom(ev.y * cfg["scroll_sens"])
             elif ev.type == JOYBUTTONDOWN:
@@ -860,9 +1088,11 @@ def main():
                     pygame.mouse.set_visible(paused)
                 elif ev.button == 1 and not paused:  # B
                     view_mode = (view_mode + 1) % len(VIEW_NAMES)
+                elif ev.button == 2 and not paused:  # X
+                    do_select = True
                 elif ev.button == 3 and not paused:  # Y
                     toggle_fullscreen()
-                elif ev.button == 7:  # Start
+                elif ev.button == 6:  # Start/Menu
                     if paused:
                         paused = False
                         sync_cfg()
@@ -944,9 +1174,37 @@ def main():
             fn = np.linalg.norm(f)
             if fn > 0:
                 f = f / fn * cur_force
+                if len(current_target) > 1:
+                    f /= len(current_target)
             ctx.setParameter("fx", float(f[0]))
             ctx.setParameter("fy", float(f[1]))
             ctx.setParameter("fz", float(f[2]))
+
+            # ── Arrow keys / D-pad → rotate current target ──
+            rot_speed = 2.0
+            rx = ry = 0.0
+            if k[K_UP]: rx -= rot_speed
+            if k[K_DOWN]: rx += rot_speed
+            if k[K_LEFT]: ry -= rot_speed
+            if k[K_RIGHT]: ry += rot_speed
+            if pad and pad.get_numhats() > 0:
+                hx, hy = pad.get_hat(0)
+                ry += hx * rot_speed
+                rx -= hy * rot_speed
+
+            if (rx != 0 or ry != 0) and len(current_target) > 1:
+                state_r = ctx.getState(getPositions=True)
+                rpos = np.array(state_r.getPositions(asNumpy=True)
+                                .value_in_unit(unit.nanometer))
+                com = rpos[current_target].mean(axis=0)
+                R = np.eye(3)
+                if ry != 0:
+                    R = rotation_matrix(np.array([0, 1, 0]), ry) @ R
+                if rx != 0:
+                    R = rotation_matrix(cam.right(), rx) @ R
+                for i in current_target:
+                    rpos[i] = com + R @ (rpos[i] - com)
+                ctx.setPositions(rpos * unit.nanometers)
 
             integrator.step(cur_mdsteps)
 
@@ -956,10 +1214,40 @@ def main():
             ke = state.getKineticEnergy().value_in_unit(unit.kilojoules_per_mole)
             temp = 2 * ke / (3 * len(pos) * 8.314e-3)
 
-            lig_c = pos[ligand[0]]
+            # ── X key → select residue under crosshair ──
+            if do_select:
+                if controlling_residue:
+                    switch_target(ligand)
+                    controlling_residue = False
+                else:
+                    yr_r = math.radians(cam.yaw)
+                    pr_r = math.radians(cam.pitch)
+                    eye = cam.target + cam.dist * np.array([
+                        math.sin(yr_r)*math.cos(pr_r), math.sin(pr_r),
+                        math.cos(yr_r)*math.cos(pr_r)])
+                    ray_dir = cam.target - eye
+                    ray_dir /= np.linalg.norm(ray_dir)
+                    atom_pos = pos[prot_idx]
+                    offsets = atom_pos - eye
+                    along = np.dot(offsets, ray_dir)
+                    mask = along > 0
+                    if mask.any():
+                        perp = offsets[mask] - along[mask, None] * ray_dir
+                        dists_r = np.linalg.norm(perp, axis=1)
+                        nearest_local = np.argmin(dists_r)
+                        nearest_atom = int(prot_idx[np.where(mask)[0][nearest_local]])
+                        if nearest_atom in atom_to_res:
+                            rkey = atom_to_res[nearest_atom]
+                            switch_target(res_atoms[rkey])
+                            controlling_residue = True
+
+            if len(current_target) == 1:
+                lig_c = pos[current_target[0]]
+            else:
+                lig_c = pos[current_target].mean(axis=0)
             cam.track(lig_c + np.array([0, 0.6, 0]))
 
-            dists = np.linalg.norm(pos[prot_heavy] - lig_c, axis=1)
+            dists = np.linalg.norm(pos[prot_idx] - lig_c, axis=1)
             contacts = int(np.sum(dists < CONTACT_CUT))
             hi_score = max(hi_score, contacts)
         else:
@@ -976,9 +1264,26 @@ def main():
         elif view_mode == 1:
             draw_protein_surface()
         else:
-            draw_protein_atoms(pos, prot_heavy, prot_elem)
+            draw_protein_atoms(pos, prot_idx, prot_elem)
         draw_water(pos, water_o, lig_c, cur_wcut)
-        draw_ligand(pos, ligand)
+        draw_ligand(pos, ligand, lig_elem, lig_bond_a, lig_bond_b, lig_bond_colors)
+        if controlling_residue:
+            center = pos[current_target].mean(axis=0)
+            glDisable(GL_LIGHTING)
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glColor4f(1.0, 0.5, 0.1, 0.15)
+            glPushMatrix()
+            glTranslatef(float(center[0]), float(center[1]), float(center[2]))
+            gluSphere(_quad, 0.5, 16, 8)
+            glPopMatrix()
+            for i in current_target:
+                p = pos[i]
+                glColor4f(1.0, 0.6, 0.1, 0.6)
+                glPushMatrix()
+                glTranslatef(float(p[0]), float(p[1]), float(p[2]))
+                gluSphere(_quad, 0.08, 8, 4)
+                glPopMatrix()
+            glDisable(GL_BLEND); glEnable(GL_LIGHTING)
         draw_axes(aw, ah, cam)
         draw_crosshair(aw, ah)
         draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
