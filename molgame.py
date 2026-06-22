@@ -5,7 +5,7 @@ Real protein MD + retro pixel-art HUD.  WASD steer, mouse look, scroll zoom.
 Usage:  python molgame.py [--pdb 1UBQ]
 """
 
-import sys, math, os, time, argparse
+import sys, math, os, time, argparse, json
 import numpy as np
 import pygame
 from pygame.locals import *
@@ -18,19 +18,47 @@ from pdbfixer import PDBFixer
 
 
 # ── Configuration ───────────────────────────────────────────
-W, H            = 1280, 720
-FPS_CAP         = 60
-MD_STEPS        = 8
-DT              = 0.004
-FORCE_MAG       = 500.0
-FRICTION        = 5.0
-MOUSE_SENS      = 0.15
-SCROLL_SENS     = 0.5
-PAD_LOOK_SENS   = 3.0
-PAD_DEADZONE    = 0.15
-TEMPERATURE     = 300.0
-RESTRAINT_K     = 0.0
-CONTACT_CUT     = 0.5
+W, H        = 1280, 720
+FPS_CAP     = 60
+DT          = 0.004
+CONTACT_CUT = 0.5
+
+DEFAULTS = {
+    "md_steps":       8,
+    "force":          500.0,
+    "friction":       5.0,
+    "temperature":    300.0,
+    "restraint_k":    0.0,
+    "mouse_sens":     0.15,
+    "scroll_sens":    0.5,
+    "pad_look_sens":  5.0,
+    "pad_zoom_sens":  0.08,
+    "pad_deadzone":   0.15,
+    "water_radius":   1.5,
+}
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                saved = json.load(f)
+            cfg.update({k: saved[k] for k in saved if k in DEFAULTS})
+            print(f"Config loaded from {CONFIG_PATH}")
+        except Exception as e:
+            print(f"Warning: could not load config: {e}")
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Warning: could not save config: {e}")
 
 CPK = {"C": (0.32, 0.32, 0.32), "N": (0.14, 0.20, 0.65),
        "O": (0.65, 0.14, 0.14), "S": (0.65, 0.60, 0.14)}
@@ -120,7 +148,7 @@ def read_pdb_title(path):
 
 
 # ── Prepare molecular system ───────────────────────────────
-def prepare(pdb_path):
+def prepare(pdb_path, cfg):
     t0 = time.time()
     print("[1/6] Fixing PDB …")
     fixer = PDBFixer(filename=pdb_path)
@@ -197,7 +225,7 @@ def prepare(pdb_path):
         nonbondedCutoff=0.9 * unit.nanometers, constraints=app.HBonds)
 
     rst = mm.CustomExternalForce("rst_k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
-    rst.addGlobalParameter("rst_k", RESTRAINT_K)
+    rst.addGlobalParameter("rst_k", cfg["restraint_k"])
     rst.addPerParticleParameter("x0")
     rst.addPerParticleParameter("y0")
     rst.addPerParticleParameter("z0")
@@ -225,13 +253,13 @@ def prepare(pdb_path):
 
     print("[6/6] Creating simulation (OpenCL) …")
     integrator = mm.LangevinMiddleIntegrator(
-        TEMPERATURE * unit.kelvin, FRICTION / unit.picosecond, DT * unit.picoseconds)
+        cfg["temperature"] * unit.kelvin, cfg["friction"] / unit.picosecond, DT * unit.picoseconds)
     platform = mm.Platform.getPlatformByName("OpenCL")
     ctx = mm.Context(system, integrator, platform)
     ctx.setPositions(all_pos * unit.nanometers)
     print("      Minimising …")
     mm.LocalEnergyMinimizer.minimize(ctx, tolerance=10.0, maxIterations=500)
-    ctx.setVelocitiesToTemperature(TEMPERATURE * unit.kelvin)
+    ctx.setVelocitiesToTemperature(cfg["temperature"] * unit.kelvin)
     print("      Equilibrating …")
     integrator.step(500)
     box = ctx.getState().getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
@@ -252,11 +280,11 @@ class Camera:
         self.target = np.zeros(3)
 
     def rotate(self, dx, dy):
-        self.yaw += dx * MOUSE_SENS
-        self.pitch = np.clip(self.pitch + dy * MOUSE_SENS, -85, 85)
+        self.yaw += dx
+        self.pitch = np.clip(self.pitch + dy, -85, 85)
 
     def zoom(self, d):
-        self.dist = np.clip(self.dist - d * SCROLL_SENS, 2.0, 25.0)
+        self.dist = np.clip(self.dist - d, 2.0, 25.0)
 
     def track(self, p, s=0.07):
         self.target += (p - self.target) * s
@@ -353,12 +381,10 @@ def draw_protein_surface():
         glCallList(_surf_dl)
 
 
-WATER_VIS_CUT = 1.5
-
-def draw_water(pos, water_o, lig_pos):
+def draw_water(pos, water_o, lig_pos, wcut):
     wp_all = pos[water_o]
     dists = np.linalg.norm(wp_all - lig_pos, axis=1)
-    nearby = wp_all[dists < WATER_VIS_CUT].astype(np.float32)
+    nearby = wp_all[dists < wcut].astype(np.float32)
     if len(nearby) == 0:
         return
     glDisable(GL_LIGHTING)
@@ -508,7 +534,7 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
     else:
         st_txt, st_col = "EXPLORING", PX["dim"]
 
-    bh = 260
+    bh = 340
     surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
     surf.fill((6, 6, 16, 180))
     pygame.draw.rect(surf, PX["border2"], (0, 0, bw, bh), 1)
@@ -575,9 +601,18 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
         kx += kw + 3
     y += box_h + 4
 
-    surf.blit(_txt("Mouse:look  Scroll:zoom  P:pause", PX["dim"], big=False),
-              (pad, y))
-    y += 16
+    # controls help
+    pygame.draw.line(surf, PX["sep"], (pad, y), (bw - pad, y))
+    y += 5
+    help_lines = [
+        "Mouse/RStick:look  Scroll/LB,RB:zoom",
+        "WASD/LStick:move   SPC/RT:up  SHF/LT:dn",
+        "V/B:view  P/A:pause  F11/Y:fullscreen",
+        "ESC/Start:quit",
+    ]
+    for line in help_lines:
+        surf.blit(_txt(line, PX["dim"], big=False), (pad, y))
+        y += 14
 
     # crop and blit
     final_h = y + 4
@@ -662,9 +697,11 @@ def main():
     pdb_title = read_pdb_title(pdb_file)
     print(f"Protein: {pdb_id}  {pdb_title}")
 
+    cfg = load_config()
+
     (ctx, integrator, prot_heavy, prot_elem,
      water_o, ligand, prot_center, surface_data,
-     box_origin, box_lengths, heavy_bonds) = prepare(pdb_file)
+     box_origin, box_lengths, heavy_bonds) = prepare(pdb_file, cfg)
     elem_map = {int(i): str(e) for i, e in zip(prot_heavy, prot_elem)}
     bond_a = np.array([a for a, b in heavy_bonds], dtype=np.int32)
     bond_b = np.array([b for a, b in heavy_bonds], dtype=np.int32)
@@ -702,7 +739,7 @@ def main():
         if pad is None or idx >= pad.get_numaxes():
             return 0.0
         v = pad.get_axis(idx)
-        return v if abs(v) > PAD_DEADZONE else 0.0
+        return v if abs(v) > cfg["pad_deadzone"] else 0.0
 
     def toggle_fullscreen():
         nonlocal fullscreen, aw, ah
@@ -732,44 +769,65 @@ def main():
     state = ctx.getState(getPositions=True)
     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
     lig_c = pos[ligand[0]]
+    cur_wcut = cfg["water_radius"]
 
-    # runtime-adjustable parameters
+    # runtime-adjustable parameters (synced with cfg on save)
     params = [
-        {"name": "Restraint K",  "key": "rst_k",   "val": float(RESTRAINT_K),
+        {"name": "Restraint K",   "cfg": "restraint_k", "val": cfg["restraint_k"],
          "min": 0, "max": 5000, "step": 50, "unit": "kJ/mol/nm2",
          "apply": lambda v: ctx.setParameter("rst_k", v)},
-        {"name": "Force",        "key": "force",    "val": float(FORCE_MAG),
+        {"name": "Force",         "cfg": "force",       "val": cfg["force"],
          "min": 50, "max": 2000, "step": 50, "unit": "kJ/mol/nm",
          "apply": None},
-        {"name": "Friction",     "key": "friction", "val": float(FRICTION),
+        {"name": "Friction",      "cfg": "friction",    "val": cfg["friction"],
          "min": 0.5, "max": 20, "step": 0.5, "unit": "1/ps",
          "apply": lambda v: integrator.setFriction(v / unit.picosecond)},
-        {"name": "Temperature",  "key": "temp",     "val": float(TEMPERATURE),
+        {"name": "Temperature",   "cfg": "temperature", "val": cfg["temperature"],
          "min": 10, "max": 1000, "step": 10, "unit": "K",
          "apply": lambda v: integrator.setTemperature(v * unit.kelvin)},
-        {"name": "MD steps",     "key": "mdsteps",  "val": float(MD_STEPS),
+        {"name": "MD steps",      "cfg": "md_steps",    "val": cfg["md_steps"],
          "min": 1, "max": 30, "step": 1, "unit": "/frame",
          "apply": None},
-        {"name": "Water radius", "key": "wcut",     "val": float(WATER_VIS_CUT),
+        {"name": "Water radius",  "cfg": "water_radius","val": cfg["water_radius"],
          "min": 0.5, "max": 5.0, "step": 0.25, "unit": "nm",
          "apply": None},
+        {"name": "Mouse sens",    "cfg": "mouse_sens",  "val": cfg["mouse_sens"],
+         "min": 0.05, "max": 1.0, "step": 0.05, "unit": "",
+         "apply": None},
+        {"name": "Scroll sens",   "cfg": "scroll_sens", "val": cfg["scroll_sens"],
+         "min": 0.1, "max": 2.0, "step": 0.1, "unit": "",
+         "apply": None},
+        {"name": "Pad look sens", "cfg": "pad_look_sens","val": cfg["pad_look_sens"],
+         "min": 0.5, "max": 10.0, "step": 0.5, "unit": "",
+         "apply": None},
+        {"name": "Pad zoom sens", "cfg": "pad_zoom_sens","val": cfg["pad_zoom_sens"],
+         "min": 0.05, "max": 1.0, "step": 0.05, "unit": "",
+         "apply": None},
     ]
+
+    def sync_cfg():
+        for p in params:
+            cfg[p["cfg"]] = p["val"]
+        save_config(cfg)
 
     while True:
         # ── Events ──
         for ev in pygame.event.get():
             if ev.type == QUIT:
-                pygame.quit(); return
+                sync_cfg(); pygame.quit(); return
             elif ev.type == KEYDOWN:
                 if ev.key == K_ESCAPE:
                     if paused:
                         paused = False
+                        sync_cfg()
                         pygame.event.set_grab(True)
                         pygame.mouse.set_visible(False)
                     else:
-                        pygame.quit(); return
+                        sync_cfg(); pygame.quit(); return
                 elif ev.key == K_p:
                     paused = not paused
+                    if not paused:
+                        sync_cfg()
                     pygame.event.set_grab(not paused)
                     pygame.mouse.set_visible(paused)
                 elif paused:
@@ -792,10 +850,12 @@ def main():
                 elif ev.key == K_F11:
                     toggle_fullscreen()
             elif ev.type == MOUSEWHEEL and not paused:
-                cam.zoom(ev.y)
+                cam.zoom(ev.y * cfg["scroll_sens"])
             elif ev.type == JOYBUTTONDOWN:
                 if ev.button == 0:  # A
                     paused = not paused
+                    if not paused:
+                        sync_cfg()
                     pygame.event.set_grab(not paused)
                     pygame.mouse.set_visible(paused)
                 elif ev.button == 1 and not paused:  # B
@@ -805,16 +865,17 @@ def main():
                 elif ev.button == 7:  # Start
                     if paused:
                         paused = False
+                        sync_cfg()
                         pygame.event.set_grab(True)
                         pygame.mouse.set_visible(False)
                     else:
-                        pygame.quit(); return
+                        sync_cfg(); pygame.quit(); return
                 elif paused:
-                    if ev.button == 4:  # LB
+                    if ev.button == 9:  # LB
                         p = params[menu_sel]
                         p["val"] = max(p["min"], p["val"] - p["step"])
                         if p["apply"]: p["apply"](p["val"])
-                    elif ev.button == 5:  # RB
+                    elif ev.button == 10:  # RB
                         p = params[menu_sel]
                         p["val"] = min(p["max"], p["val"] + p["step"])
                         if p["apply"]: p["apply"](p["val"])
@@ -843,18 +904,21 @@ def main():
 
         if not paused:
             mdx, mdy = pygame.mouse.get_rel()
-            cam.rotate(-mdx, mdy)
+            ms = cfg["mouse_sens"]
+            cam.rotate(-mdx * ms, mdy * ms)
 
             # gamepad right stick → camera
-            cam.rotate(-pad_axis(2) * PAD_LOOK_SENS, pad_axis(3) * PAD_LOOK_SENS)
+            pls = cfg["pad_look_sens"]
+            cam.rotate(-pad_axis(2) * pls, pad_axis(3) * pls)
             # gamepad bumpers → zoom
-            if pad and pad.get_numbuttons() > 5:
-                if pad.get_button(4): cam.zoom(1)
-                if pad.get_button(5): cam.zoom(-1)
+            pzs = cfg["pad_zoom_sens"]
+            if pad and pad.get_numbuttons() > 10:
+                if pad.get_button(9): cam.zoom(pzs)
+                if pad.get_button(10): cam.zoom(-pzs)
 
-            cur_force = params[1]["val"]
-            cur_mdsteps = int(params[4]["val"])
-            cur_wcut = params[5]["val"]
+            cur_force = cfg["force"]
+            cur_mdsteps = int(cfg["md_steps"])
+            cur_wcut = cfg["water_radius"]
 
             # ── Input → force (keyboard + gamepad left stick + triggers) ──
             k = pygame.key.get_pressed()
@@ -913,7 +977,7 @@ def main():
             draw_protein_surface()
         else:
             draw_protein_atoms(pos, prot_heavy, prot_elem)
-        draw_water(pos, water_o, lig_c)
+        draw_water(pos, water_o, lig_c, cur_wcut)
         draw_ligand(pos, ligand)
         draw_axes(aw, ah, cam)
         draw_crosshair(aw, ah)
