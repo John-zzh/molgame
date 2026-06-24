@@ -22,6 +22,8 @@ STANDARD_RESIDUES = {
     "TYR", "VAL",
 }
 
+WATER_RESIDUES = {"HOH", "WAT"}
+
 
 def gaff_cache_path():
     cwd_path = os.path.abspath("gaff_cache.json")
@@ -302,8 +304,21 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None):
     prot_idx, prot_elem, water_o, ca_idx = [], [], [], []
     ca_traces = {}
     lig_indices, lig_elem = [], []
+    atom_records = []
     for atom in modeller.topology.atoms():
-        if atom.residue.name in ("HOH", "WAT"):
+        res = atom.residue
+        chain_id = res.chain.id.strip()[:1] if res.chain.id else chr(65 + (res.chain.index % 26))
+        atom_records.append({
+            "index": atom.index,
+            "name": atom.name,
+            "element": atom.element.symbol if atom.element is not None else "",
+            "resname": res.name,
+            "resid": res.id,
+            "chain": chain_id,
+            "is_water": res.name in WATER_RESIDUES,
+            "is_protein": res.name in STANDARD_RESIDUES,
+        })
+        if atom.residue.name in WATER_RESIDUES:
             if atom.element.symbol == "O":
                 water_o.append(atom.index)
         elif has_ligand and atom.index in lig_set:
@@ -463,4 +478,5 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None):
             box_origin, np.diag(box), prot_bonds,
             np.array(lig_elem), lig_bonds,
             pf, pf_map, tf, tf_map, res_atoms, chain_atoms,
-            [np.array(trace, dtype=np.int32) for trace in ca_traces.values()])
+            [np.array(trace, dtype=np.int32) for trace in ca_traces.values()],
+            atom_records)

@@ -6,6 +6,8 @@ from .config import PX
 
 _hud_font = None
 _hud_font_sm = None
+_pe_history = []
+_PE_HISTORY_MAX = 240
 
 
 def _txt(text, color, big=True):
@@ -17,9 +19,51 @@ def _txt(text, color, big=True):
     return font.render(text, False, color)
 
 
+def _push_pe(pe, pe_no_steer):
+    _pe_history.append(float(pe_no_steer))
+    if len(_pe_history) > _PE_HISTORY_MAX:
+        del _pe_history[:len(_pe_history) - _PE_HISTORY_MAX]
+
+
+def _draw_pe_history(surf, x, y, w, h):
+    if len(_pe_history) < 2:
+        pygame.draw.rect(surf, PX["sep"], (x, y, w, h), 1)
+        return
+    lo, hi = min(_pe_history), max(_pe_history)
+    if hi - lo < 1e-6:
+        hi = lo + 1.0
+
+    pygame.draw.rect(surf, (8, 10, 18), (x, y, w, h))
+    pygame.draw.rect(surf, PX["sep"], (x, y, w, h), 1)
+    mid_y = y + h // 2
+    pygame.draw.line(surf, (26, 34, 48), (x + 1, mid_y), (x + w - 2, mid_y), 1)
+
+    def points():
+        pts = []
+        n = len(_pe_history)
+        for i, value in enumerate(_pe_history):
+            px = x + 2 + int(i * (w - 4) / max(1, n - 1))
+            norm = (value - lo) / (hi - lo)
+            py = y + h - 3 - int(norm * (h - 6))
+            pts.append((px, py))
+        return pts
+
+    clean_pts = points()
+    if len(clean_pts) >= 2:
+        pygame.draw.lines(surf, PX["ok"], False, clean_pts, 2)
+
+    label = _txt(f"{lo:.0f}..{hi:.0f}", PX["dim"], big=False)
+    surf.blit(label, (x + 4, y + 3))
+    lx = x + w - 112
+    ly = y + 4
+    pygame.draw.line(surf, PX["ok"], (lx, ly + 6), (lx + 18, ly + 6), 2)
+    surf.blit(_txt("clean PE", PX["dim"], big=False), (lx + 24, ly - 1))
+
+
 def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
              hi_score, fps, active_keys, view_name, pe_no_steer, select_scope,
              force_mode, frame):
+    _push_pe(pe, pe_no_steer)
     pad = 10
     lh = 25
     bw = 420
@@ -32,7 +76,7 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
     else:
         st_txt, st_col = "EXPLORING", PX["dim"]
 
-    bh = 400
+    bh = 560
     surf = pygame.Surface((bw, bh), pygame.SRCALPHA)
     surf.fill((6, 6, 16, 210))
     pygame.draw.rect(surf, PX["border2"], (0, 0, bw, bh), 1)
@@ -70,6 +114,8 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
     y += lh - 4
     surf.blit(_txt(f"PE clean {pe_no_steer:10.0f} kJ/mol", PX["dim"], big=False), (pad, y))
     y += lh - 4
+    _draw_pe_history(surf, pad, y, bw - 2 * pad, 112)
+    y += 118
     surf.blit(_txt(f"Temp {temp:5.0f}K  FPS {fps:3.0f}", PX["dim"], big=False), (pad, y))
     y += lh - 4
     vn = view_name
@@ -160,7 +206,7 @@ def draw_pause_menu(aw, ah, params, sel):
         surf.blit(_txt(line, col, big=False), (20, y))
         y += 34
 
-    surf.blit(_txt("  Left/Right to adjust", (100, 100, 130), big=False),
+    surf.blit(_txt("  Left/Right adjust   S save PDB", (100, 100, 130), big=False),
               (20, y))
 
     data = pygame.image.tostring(surf, "RGBA", True)

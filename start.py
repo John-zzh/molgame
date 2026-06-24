@@ -7,7 +7,7 @@ Usage:  python start.py [--pdb 1UBQ]
         python start.py [--pdb-file protein.pdb --ligand-file ligand.sdf]
 """
 
-import sys, math, os, argparse
+import sys, math, os, argparse, time
 import numpy as np
 import pygame
 from pygame.locals import *
@@ -73,7 +73,7 @@ def main():
      box_origin, box_lengths, prot_bonds,
      lig_elem, lig_bonds,
      steer_force, steer_map, torque_force, torque_map,
-     res_atoms, chain_atoms, ca_traces) = prepare(
+     res_atoms, chain_atoms, ca_traces, atom_records) = prepare(
         pdb_file, cfg, lig_name, ion_name, ligand_file)
     has_real_ligand = lig_name is not None or ligand_file is not None
 
@@ -233,6 +233,7 @@ def main():
     LIGAND_STYLE_NAMES = ["Ball", "Line"]
     SELECT_SCOPE_NAMES = ["Residue", "Chain"]
     FORCE_MODE_NAMES = ["Total", "Per atom"]
+    SAVE_WATER_NAMES = ["No", "Yes"]
     view_mode = 0
     hi_score = 0
     frame = 0
@@ -257,7 +258,7 @@ def main():
          "apply": lambda v: ctx.setParameter("rst_k", v)},
         {"name": "Force",         "cfg": "force",       "val": cfg["force"],
          "min": 50, "max": 50000 if has_real_ligand else 2000,
-         "step": 500 if has_real_ligand else 50, "unit": "kJ/mol/nm",
+         "step": 10, "unit": "kJ/mol/nm",
          "apply": None},
         {"name": "Force mode",    "cfg": "force_mode",  "val": cfg["force_mode"],
          "min": 0, "max": len(FORCE_MODE_NAMES) - 1, "step": 1, "unit": "",
@@ -267,7 +268,7 @@ def main():
          "min": 1.0, "max": 50.0, "step": 1.0, "unit": "x",
          "apply": None},
         {"name": "Torque",        "cfg": "torque_force", "val": cfg["torque_force"],
-         "min": 0.0, "max": 5000.0, "step": 50.0, "unit": "kJ/mol/nm",
+         "min": 0.0, "max": 5000.0, "step": 10.0, "unit": "kJ/mol/nm",
          "apply": None},
         {"name": "Friction",      "cfg": "friction",    "val": cfg["friction"],
          "min": 0.5, "max": 20, "step": 0.5, "unit": "1/ps",
@@ -307,6 +308,10 @@ def main():
          "min": 0, "max": len(SELECT_SCOPE_NAMES) - 1, "step": 1, "unit": "",
          "choices": SELECT_SCOPE_NAMES,
          "apply": None},
+        {"name": "Save water", "cfg": "save_water", "val": cfg["save_water"],
+         "min": 0, "max": len(SAVE_WATER_NAMES) - 1, "step": 1, "unit": "",
+         "choices": SAVE_WATER_NAMES,
+         "apply": None},
         {"name": "Cross size",  "cfg": "cross_size",   "val": cfg["cross_size"],
          "min": 4, "max": 40, "step": 2, "unit": "px",
          "apply": None},
@@ -324,12 +329,59 @@ def main():
     for p in params:
         cfg[p["cfg"]] = p["val"]
 
+    def pdb_atom_name(name, element):
+        n = str(name)[:4]
+        e = str(element).strip()
+        if len(n) < 4 and len(e) < 2:
+            return f" {n:<3s}"
+        return f"{n:<4s}"
+
+    def pdb_resid(value, fallback):
+        try:
+            return max(-999, min(9999, int(str(value).strip())))
+        except Exception:
+            return ((fallback - 1) % 9999) + 1
+
+    def save_current_structure(cur_pos, include_water=False):
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        suffix = "all" if include_water else "dry"
+        path = os.path.abspath(f"molgame_snapshot_{stamp}_{suffix}.pdb")
+        serial = 1
+        with open(path, "w") as f:
+            f.write("REMARK Saved by MolGame\n")
+            f.write(f"REMARK Water included: {'yes' if include_water else 'no'}\n")
+            for rec in atom_records:
+                if rec["is_water"] and not include_water:
+                    continue
+                idx = rec["index"]
+                if idx >= len(cur_pos):
+                    continue
+                p = cur_pos[idx] * 10.0
+                record = "ATOM" if rec["is_protein"] else "HETATM"
+                name = pdb_atom_name(rec["name"], rec["element"])
+                resname = str(rec["resname"])[:3].rjust(3)
+                chain = str(rec["chain"] or "A")[:1]
+                resid = pdb_resid(rec["resid"], serial)
+                elem = str(rec["element"]).strip()[:2].rjust(2)
+                f.write(
+                    f"{record:<6}{serial:5d} {name} {resname} {chain}{resid:4d}"
+                    f"    {p[0]:8.3f}{p[1]:8.3f}{p[2]:8.3f}"
+                    f"  1.00  0.00          {elem}\n"
+                )
+                serial += 1
+            f.write("END\n")
+        print(f"Saved structure: {path}")
+
     while True:
         # ── Events ──
         do_select = False
+        mouse_dx, mouse_dy = 0, 0
         for ev in pygame.event.get():
             if ev.type == QUIT:
                 sync_cfg(); pygame.quit(); return
+            elif ev.type == MOUSEMOTION and not paused:
+                mouse_dx += ev.rel[0]
+                mouse_dy += ev.rel[1]
             elif ev.type == KEYDOWN:
                 if ev.key == K_ESCAPE:
                     if paused:
@@ -344,7 +396,9 @@ def main():
                         sync_cfg()
                     set_mouse_capture(not paused)
                 elif paused:
-                    if ev.key == K_UP:
+                    if ev.key == K_s:
+                        save_current_structure(pos, include_water=bool(int(cfg["save_water"])))
+                    elif ev.key == K_UP:
                         menu_sel = (menu_sel - 1) % len(params)
                     elif ev.key == K_DOWN:
                         menu_sel = (menu_sel + 1) % len(params)
@@ -437,7 +491,7 @@ def main():
                     (hasattr(pygame.mouse, "get_relative_mode")
                      and not pygame.mouse.get_relative_mode())):
                 set_mouse_capture(True)
-            mdx, mdy = pygame.mouse.get_rel()
+            mdx, mdy = mouse_dx, mouse_dy
             ms = cfg["mouse_sens"]
             cam.rotate(-mdx * ms, mdy * ms)
 
@@ -638,12 +692,13 @@ def main():
         draw_ligand(pos, ligand, lig_elem, lig_bond_a, lig_bond_b, lig_bond_colors,
                     is_ion=ion_name is not None,
                     active_set=set(current_target) if ion_name else None,
-                    ligand_style=int(cfg["ligand_style"]))
+                    ligand_style=int(cfg["ligand_style"]),
+                    show_glow=control_mode != "free")
         if control_mode == "residue":
             draw_selected_residue(pos, current_target)
         draw_axes(aw, ah, cam)
-        draw_crosshair(aw, ah, size=int(cfg["cross_size"]),
-                       color=CROSS_COLORS[int(cfg["cross_color"])])
+        cross_color = CROSS_COLORS[2] if control_mode == "free" else CROSS_COLORS[int(cfg["cross_color"])]
+        draw_crosshair(aw, ah, size=int(cfg["cross_size"]), color=cross_color)
         draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
                  hi_score, clock.get_fps(), active_keys, VIEW_NAMES[view_mode],
                  pe_no_steer,

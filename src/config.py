@@ -23,6 +23,7 @@ DEFAULTS = {
     "aim_offset_y":   1.4,
     "ligand_style":   0,
     "select_scope":   0,
+    "save_water":     0,
     "cross_size":     12,
     "cross_color":    0,
 }

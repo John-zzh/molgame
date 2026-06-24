@@ -13,6 +13,8 @@ Real-time molecular dynamics game powered by [OpenMM](https://openmm.org/). Stee
 - **Ligands and ions** — Control a GAFF2-parameterized ligand or ions initialized from the PDB
 - **Multiple views** — Sticks, molecular surface, and C-alpha backbone views, switchable with `V`
 - **Ligand styles** — Switch real ligands between CPK ball and line render modes with `L`
+- **Live telemetry** — HUD shows total PE, clean PE, and a rolling clean-PE history graph
+- **Snapshots** — Save the current protein/ligand structure from the pause menu, with optional water
 - **Retro pixel UI** — NES/Contra-inspired HUD, scanline CRT overlay, proximity bar, hi-score tracking, pause menu
 - **GPU accelerated** — OpenCL for MD (OpenMM) + OpenGL for rendering, runs at 60 fps
 
@@ -92,7 +94,7 @@ When multiple matching ions are present, the first starts as the active target. 
 | `Space` | Move up |
 | `Shift` | Move down |
 | Mouse | Look around |
-| Arrow keys | Apply torque to the selected target |
+| Arrow keys | Apply physical torque force to the selected target |
 | Scroll | Zoom in / out |
 | `X` | Cycle ligand/control target → free look → selected residue/ion |
 | `V` | Cycle sticks / surface / backbone view |
@@ -103,11 +105,15 @@ When multiple matching ions are present, the first starts as the active target. 
 
 Gamepads are also supported: left stick moves, right stick looks, triggers move vertically, D-pad applies torque, `A` pauses, `B` changes view, `X` selects, and `Y` toggles fullscreen.
 
+When `X` enters free/select mode, the crosshair turns yellow and the ligand glow is hidden. This is the visual cue that the next `X` press will pick a new target.
+
 The pause menu includes `Select scope`, which controls what `X` selects when aiming at protein atoms: `Residue` selects the hit residue, while `Chain` selects the entire protein chain containing the hit atom.
 
 The pause menu also includes `Force mode`. `Total` divides the requested force across all selected atoms, while `Per atom` applies the requested force to each selected atom so large selections such as chains move more noticeably.
 
 Real ligands can feel harder to move than selected protein residues because they are usually buried in a pocket and strongly coupled to surrounding atoms. `Lig force x` scales steering force only when controlling the original ligand target.
+
+While paused, press `S` to save the current structure as `molgame_snapshot_YYYYMMDD_HHMMSS_dry.pdb` or `_all.pdb` in the current working directory. The `Save water` menu option controls whether waters are included; the default `No` saves protein and ligand only. Extra particles that are not part of the topology, such as the default probe atom, are not written.
 
 ## How It Works
 
@@ -123,12 +129,13 @@ Real ligands can feel harder to move than selected protein residues because they
 
 2. **Game loop** — Each frame:
    - WASD input is converted to a force vector in the camera's reference frame
-   - The force is applied to the probe atom via `CustomExternalForce`
+   - The steering force is applied through `CustomExternalForce`
+   - Arrow keys/D-pad apply a separate torque `CustomExternalForce` to the current multi-atom target
    - OpenMM advances the simulation with the configured MD steps per frame
-   - HUD energy shows both total potential energy and potential energy with steering force removed
+   - HUD energy shows total PE, clean PE, and a rolling clean-PE graph; clean PE subtracts steering/torque force-group energy
    - Atom positions are read back and rendered with OpenGL
 
-3. **Target selection** — `X` switches from direct target control to free-look selection. From there, aim at a residue or ion and press `X` again to steer it. Press `X` once more while steering a selected residue to return to the original ligand/probe/ion target.
+3. **Target selection** — `X` switches from direct target control to free-look selection. From there, aim at a residue, chain, or ion and press `X` again to steer it. Press `X` once more while steering a selected protein target to return to the original ligand/probe/ion target.
 
 4. **Stability controls** — The pause menu can adjust force, force mode, ligand force scale, torque force, friction, temperature, MD steps per frame, timestep, C-alpha restraint strength, water draw radius, mouse look sensitivity, aim offset, ligand style, select scope, and crosshair style.
 

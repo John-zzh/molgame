@@ -181,7 +181,7 @@ def draw_water(pos, water_o, lig_pos, wcut):
 
 def draw_ligand(pos, lig, lig_elem=None, lig_bond_a=None, lig_bond_b=None,
                 lig_bond_colors=None, is_ion=False, active_set=None,
-                ligand_style=0):
+                ligand_style=0, show_glow=True):
     if is_ion:
         for idx in lig:
             p = pos[idx]
@@ -250,15 +250,16 @@ def draw_ligand(pos, lig, lig_elem=None, lig_bond_a=None, lig_bond_b=None,
             glPopMatrix()
         glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
         glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 50.0)
-        center = pos[lig].mean(axis=0)
-        glDisable(GL_LIGHTING)
-        glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glColor4f(*CL["lig_glow"])
-        glPushMatrix()
-        glTranslatef(float(center[0]), float(center[1]), float(center[2]))
-        gluSphere(_quad, 0.5, 16, 8)
-        glPopMatrix()
-        glDisable(GL_BLEND); glEnable(GL_LIGHTING)
+        if show_glow:
+            center = pos[lig].mean(axis=0)
+            glDisable(GL_LIGHTING)
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glColor4f(*CL["lig_glow"])
+            glPushMatrix()
+            glTranslatef(float(center[0]), float(center[1]), float(center[2]))
+            gluSphere(_quad, 0.5, 16, 8)
+            glPopMatrix()
+            glDisable(GL_BLEND); glEnable(GL_LIGHTING)
 
 
 def draw_grid(origin, lengths, step=0.5):
