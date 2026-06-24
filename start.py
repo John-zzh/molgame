@@ -28,6 +28,50 @@ from src.render import (Camera, gl_init, build_surface_dl, set_surf_dl,
 from src.hud import draw_hud, draw_pause_menu
 
 
+HUD_PANEL_W = 450
+ENERGY_UPDATE_INTERVAL = 0.5
+
+
+def set_scene_viewport(x, y, w, h):
+    glViewport(x, y, max(1, w), max(1, h))
+    glMatrixMode(GL_PROJECTION)
+    glLoadIdentity()
+    gluPerspective(50, max(1, w) / max(1, h), 0.05, 200)
+    glMatrixMode(GL_MODELVIEW)
+
+
+def draw_panel_separator(panel_w, aw, ah):
+    glViewport(0, 0, aw, ah)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, aw, 0, ah, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_LIGHTING)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glColor4f(0.0, 0.55, 0.75, 0.65)
+    glLineWidth(1.5)
+    glBegin(GL_LINES)
+    glVertex2i(panel_w, 0)
+    glVertex2i(panel_w, ah)
+    glEnd()
+    glDisable(GL_BLEND)
+    glEnable(GL_DEPTH_TEST)
+    glEnable(GL_LIGHTING)
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+
+
+def event_type(name):
+    return getattr(pygame, name, None)
+
+
 def main():
     parser = argparse.ArgumentParser(description="MolGame — Molecular Dynamics Game")
     parser.add_argument("--pdb", default="1UBQ", help="PDB ID (default: 1UBQ)")
@@ -39,6 +83,8 @@ def main():
                         help="Local ligand .sdf or .mol2 file with explicit H and 3D coordinates")
     parser.add_argument("--ion", default=None,
                         help="Control an existing ion in PDB (e.g. CA, NA, MG)")
+    parser.add_argument("--platform", default=os.environ.get("MOLGAME_OPENMM_PLATFORM", "auto"),
+                        help="OpenMM platform: auto, CUDA, OpenCL, CPU, or Reference")
     args = parser.parse_args()
     lig_name = args.ligand.upper() if args.ligand else None
     ligand_file = os.path.abspath(args.ligand_file) if args.ligand_file else None
@@ -74,7 +120,7 @@ def main():
      lig_elem, lig_bonds,
      steer_force, steer_map, torque_force, torque_map,
      res_atoms, chain_atoms, ca_traces, atom_records) = prepare(
-        pdb_file, cfg, lig_name, ion_name, ligand_file)
+        pdb_file, cfg, lig_name, ion_name, ligand_file, args.platform)
     has_real_ligand = lig_name is not None or ligand_file is not None
 
     if ion_name and len(ligand) > 1:
@@ -209,9 +255,27 @@ def main():
 
     def set_mouse_capture(enabled):
         pygame.event.set_grab(enabled)
+        if hasattr(pygame.event, "set_keyboard_grab"):
+            try:
+                pygame.event.set_keyboard_grab(enabled)
+            except pygame.error:
+                pass
         pygame.mouse.set_visible(not enabled)
         if hasattr(pygame.mouse, "set_relative_mode"):
             pygame.mouse.set_relative_mode(enabled)
+        pygame.mouse.get_rel()
+
+    def mouse_capture_ok():
+        if not pygame.event.get_grab():
+            return False
+        if (hasattr(pygame.mouse, "get_relative_mode")
+                and not pygame.mouse.get_relative_mode()):
+            return False
+        return True
+
+    def reset_live_mouse():
+        set_mouse_capture(True)
+        pygame.event.clear(MOUSEMOTION)
         pygame.mouse.get_rel()
 
     def toggle_fullscreen():
@@ -240,11 +304,12 @@ def main():
     paused = False
     menu_sel = 0
     pe, pe_no_steer, temp, contacts = 0.0, 0.0, 300.0, 0
+    next_energy_update = 0.0
+    pe_updated = False
     nan_frames = 0
     nan_total = 0
     nan_pause_reported = False
     prev_x_pressed = False
-    prev_a_pressed = False
 
     state = ctx.getState(getPositions=True)
     pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
@@ -257,7 +322,7 @@ def main():
          "min": 0, "max": 5000, "step": 50, "unit": "kJ/mol/nm2",
          "apply": lambda v: ctx.setParameter("rst_k", v)},
         {"name": "Force",         "cfg": "force",       "val": cfg["force"],
-         "min": 50, "max": 50000 if has_real_ligand else 2000,
+         "min": 10, "max": 50000 if has_real_ligand else 2000,
          "step": 10, "unit": "kJ/mol/nm",
          "apply": None},
         {"name": "Force mode",    "cfg": "force_mode",  "val": cfg["force_mode"],
@@ -312,6 +377,8 @@ def main():
          "min": 0, "max": len(SAVE_WATER_NAMES) - 1, "step": 1, "unit": "",
          "choices": SAVE_WATER_NAMES,
          "apply": None},
+        {"name": "Save PDB", "action": "save_pdb", "val": "Press Y/Enter", "unit": "",
+         "apply": None},
         {"name": "Cross size",  "cfg": "cross_size",   "val": cfg["cross_size"],
          "min": 4, "max": 40, "step": 2, "unit": "px",
          "apply": None},
@@ -323,11 +390,13 @@ def main():
 
     def sync_cfg():
         for p in params:
-            cfg[p["cfg"]] = p["val"]
+            if "cfg" in p:
+                cfg[p["cfg"]] = p["val"]
         save_config(cfg)
 
     for p in params:
-        cfg[p["cfg"]] = p["val"]
+        if "cfg" in p:
+            cfg[p["cfg"]] = p["val"]
 
     def pdb_atom_name(name, element):
         n = str(name)[:4]
@@ -375,10 +444,19 @@ def main():
     while True:
         # ── Events ──
         do_select = False
+        reset_mouse_this_frame = False
         mouse_dx, mouse_dy = 0, 0
         for ev in pygame.event.get():
             if ev.type == QUIT:
                 sync_cfg(); pygame.quit(); return
+            elif ev.type in (event_type("WINDOWFOCUSGAINED"),
+                             event_type("WINDOWENTER"),
+                             event_type("WINDOWSHOWN")):
+                if not paused:
+                    reset_mouse_this_frame = True
+            elif ev.type == event_type("ACTIVEEVENT"):
+                if not paused and getattr(ev, "gain", 0):
+                    reset_mouse_this_frame = True
             elif ev.type == MOUSEMOTION and not paused:
                 mouse_dx += ev.rel[0]
                 mouse_dy += ev.rel[1]
@@ -398,18 +476,24 @@ def main():
                 elif paused:
                     if ev.key == K_s:
                         save_current_structure(pos, include_water=bool(int(cfg["save_water"])))
+                    elif ev.key in (K_RETURN, K_SPACE):
+                        p = params[menu_sel]
+                        if p.get("action") == "save_pdb":
+                            save_current_structure(pos, include_water=bool(int(cfg["save_water"])))
                     elif ev.key == K_UP:
                         menu_sel = (menu_sel - 1) % len(params)
                     elif ev.key == K_DOWN:
                         menu_sel = (menu_sel + 1) % len(params)
                     elif ev.key in (K_RIGHT, K_EQUALS, K_PLUS):
                         p = params[menu_sel]
-                        p["val"] = min(p["max"], p["val"] + p["step"])
+                        if "action" not in p:
+                            p["val"] = min(p["max"], p["val"] + p["step"])
                         if p["apply"]:
                             p["apply"](p["val"])
                     elif ev.key in (K_LEFT, K_MINUS):
                         p = params[menu_sel]
-                        p["val"] = max(p["min"], p["val"] - p["step"])
+                        if "action" not in p:
+                            p["val"] = max(p["min"], p["val"] - p["step"])
                         if p["apply"]:
                             p["apply"](p["val"])
                 elif ev.key == K_v:
@@ -436,8 +520,13 @@ def main():
                     view_mode = (view_mode + 1) % len(VIEW_NAMES)
                 elif ev.button == 2 and not paused:  # X
                     do_select = True
-                elif ev.button == 3 and not paused:  # Y
-                    toggle_fullscreen()
+                elif ev.button == 3:  # Y
+                    if paused:
+                        p = params[menu_sel]
+                        if p.get("action") == "save_pdb":
+                            save_current_structure(pos, include_water=bool(int(cfg["save_water"])))
+                    else:
+                        toggle_fullscreen()
                 elif ev.button == 6:  # Start/Menu
                     if paused:
                         paused = False
@@ -448,11 +537,13 @@ def main():
                 elif paused:
                     if ev.button == 9:  # LB
                         p = params[menu_sel]
-                        p["val"] = max(p["min"], p["val"] - p["step"])
+                        if "action" not in p:
+                            p["val"] = max(p["min"], p["val"] - p["step"])
                         if p["apply"]: p["apply"](p["val"])
                     elif ev.button == 10:  # RB
                         p = params[menu_sel]
-                        p["val"] = min(p["max"], p["val"] + p["step"])
+                        if "action" not in p:
+                            p["val"] = min(p["max"], p["val"] + p["step"])
                         if p["apply"]: p["apply"](p["val"])
             elif ev.type == JOYHATMOTION and paused:
                 hx, hy = ev.value
@@ -462,11 +553,13 @@ def main():
                     menu_sel = (menu_sel + 1) % len(params)
                 elif hx == 1:
                     p = params[menu_sel]
-                    p["val"] = min(p["max"], p["val"] + p["step"])
+                    if "action" not in p:
+                        p["val"] = min(p["max"], p["val"] + p["step"])
                     if p["apply"]: p["apply"](p["val"])
                 elif hx == -1:
                     p = params[menu_sel]
-                    p["val"] = max(p["min"], p["val"] - p["step"])
+                    if "action" not in p:
+                        p["val"] = max(p["min"], p["val"] - p["step"])
                     if p["apply"]: p["apply"](p["val"])
             elif ev.type == JOYDEVICEADDED:
                 if pad is None:
@@ -477,20 +570,12 @@ def main():
                 pad = None
                 print("Gamepad disconnected")
 
-        if pad and pad.get_numbuttons() > 0:
-            a_now = pad.get_button(0)
-            if a_now and not prev_a_pressed:
-                paused = not paused
-                if not paused:
-                    sync_cfg()
-                set_mouse_capture(not paused)
-            prev_a_pressed = a_now
-
         if not paused:
-            if (not pygame.event.get_grab() or
-                    (hasattr(pygame.mouse, "get_relative_mode")
-                     and not pygame.mouse.get_relative_mode())):
-                set_mouse_capture(True)
+            rel_limit = max(240, min(aw, ah) // 2)
+            if (reset_mouse_this_frame or not mouse_capture_ok()
+                    or abs(mouse_dx) > rel_limit or abs(mouse_dy) > rel_limit):
+                reset_live_mouse()
+                mouse_dx, mouse_dy = 0, 0
             mdx, mdy = mouse_dx, mouse_dy
             ms = cfg["mouse_sens"]
             cam.rotate(-mdx * ms, mdy * ms)
@@ -563,20 +648,26 @@ def main():
 
             try:
                 integrator.step(cur_mdsteps)
-                state = ctx.getState(getPositions=True, getEnergy=True)
+                state = ctx.getState(getPositions=True)
                 pos = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
                 if np.any(np.isnan(pos)):
                     raise RuntimeError("NaN")
                 prev_pos = pos.copy()
                 nan_frames = 0
                 nan_pause_reported = False
-                pe = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-                steer_state = ctx.getState(getEnergy=True, groups={31})
-                steer_pe = steer_state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-                pe_no_steer = pe - steer_pe
-                ke = state.getKineticEnergy().value_in_unit(unit.kilojoules_per_mole)
-                temp = 2 * ke / (3 * len(pos) * 8.314e-3)
+                now = time.perf_counter()
+                pe_updated = now >= next_energy_update
+                if pe_updated:
+                    energy_state = ctx.getState(getEnergy=True)
+                    pe = energy_state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                    steer_state = ctx.getState(getEnergy=True, groups={31})
+                    steer_pe = steer_state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                    pe_no_steer = pe - steer_pe
+                    ke = energy_state.getKineticEnergy().value_in_unit(unit.kilojoules_per_mole)
+                    temp = 2 * ke / (3 * len(pos) * 8.314e-3)
+                    next_energy_update = now + ENERGY_UPDATE_INTERVAL
             except Exception:
+                pe_updated = False
                 try:
                     ctx.reinitialize(preserveState=False)
                 except Exception:
@@ -673,10 +764,15 @@ def main():
             hi_score = max(hi_score, contacts)
         else:
             active_keys = [False] * 6
+            pe_updated = False
             clear_torque()
             pygame.mouse.get_rel()
 
+        scene_x = min(HUD_PANEL_W, max(0, aw - 320))
+        scene_w = max(1, aw - scene_x)
+
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        set_scene_viewport(scene_x, 0, scene_w, ah)
         cam.apply()
 
         draw_grid(box_origin, box_lengths)
@@ -698,15 +794,20 @@ def main():
             draw_selected_residue(pos, current_target)
         draw_axes(aw, ah, cam)
         cross_color = CROSS_COLORS[2] if control_mode == "free" else CROSS_COLORS[int(cfg["cross_color"])]
-        draw_crosshair(aw, ah, size=int(cfg["cross_size"]), color=cross_color)
+        glViewport(scene_x, 0, scene_w, ah)
+        draw_crosshair(scene_w, ah, size=int(cfg["cross_size"]), color=cross_color)
+        glViewport(0, 0, aw, ah)
+        draw_panel_separator(scene_x, aw, ah)
         draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
                  hi_score, clock.get_fps(), active_keys, VIEW_NAMES[view_mode],
                  pe_no_steer,
                  SELECT_SCOPE_NAMES[int(cfg["select_scope"])],
-                 FORCE_MODE_NAMES[int(cfg["force_mode"])], frame)
+                 FORCE_MODE_NAMES[int(cfg["force_mode"])], frame, pe_updated)
 
         if paused:
-            draw_pause_menu(aw, ah, params, menu_sel)
+            glViewport(scene_x, 0, scene_w, ah)
+            draw_pause_menu(scene_w, ah, params, menu_sel)
+            glViewport(0, 0, aw, ah)
 
         pygame.display.flip()
         clock.tick(FPS_CAP)

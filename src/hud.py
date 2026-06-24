@@ -62,8 +62,9 @@ def _draw_pe_history(surf, x, y, w, h):
 
 def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
              hi_score, fps, active_keys, view_name, pe_no_steer, select_scope,
-             force_mode, frame):
-    _push_pe(pe, pe_no_steer)
+             force_mode, frame, pe_updated=False):
+    if pe_updated:
+        _push_pe(pe, pe_no_steer)
     pad = 10
     lh = 25
     bw = 420
@@ -179,7 +180,11 @@ def draw_hud(aw, ah, pdb_id, pdb_title, pe, temp, contacts,
 
 
 def draw_pause_menu(aw, ah, params, sel):
-    pw, ph = 520, len(params) * 34 + 88
+    row_h = 34
+    visible_rows = max(5, min(len(params), (ah - 120) // row_h))
+    first = min(max(0, sel - visible_rows // 2), max(0, len(params) - visible_rows))
+    last = min(len(params), first + visible_rows)
+    pw, ph = 520, visible_rows * row_h + 104
     surf = pygame.Surface((pw, ph), pygame.SRCALPHA)
     surf.fill((6, 6, 20, 238))
     pygame.draw.rect(surf, (0, 180, 220), (0, 0, pw, ph), 2)
@@ -191,23 +196,27 @@ def draw_pause_menu(aw, ah, params, sel):
     pygame.draw.line(surf, (40, 60, 80), (10, y), (pw - 10, y))
     y += 12
 
-    for i, p in enumerate(params):
+    for i, p in enumerate(params[first:last], start=first):
         selected = (i == sel)
         col = (0, 255, 200) if selected else (160, 160, 180)
         arrow = "> " if selected else "  "
         v = p["val"]
         if "choices" in p:
             vstr = p["choices"][int(v)]
+        elif isinstance(v, str):
+            vstr = v
         elif v == int(v):
             vstr = f"{int(v)}"
         else:
             vstr = f"{v:.1f}"
         line = f"{arrow}{p['name']:14s} {vstr:>8s} {p['unit']}"
         surf.blit(_txt(line, col, big=False), (20, y))
-        y += 34
+        y += row_h
 
-    surf.blit(_txt("  Left/Right adjust   S save PDB", (100, 100, 130), big=False),
-              (20, y))
+    pygame.draw.line(surf, (40, 60, 80), (10, y), (pw - 10, y))
+    y += 8
+    footer = f"  {sel + 1}/{len(params)}  Left/Right adjust   Y/Enter save"
+    surf.blit(_txt(footer, (100, 100, 130), big=False), (20, y))
 
     data = pygame.image.tostring(surf, "RGBA", True)
     sw, sh = surf.get_size()

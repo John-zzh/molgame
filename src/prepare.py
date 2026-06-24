@@ -25,6 +25,33 @@ STANDARD_RESIDUES = {
 WATER_RESIDUES = {"HOH", "WAT"}
 
 
+def openmm_platform_names():
+    return [mm.Platform.getPlatform(i).getName()
+            for i in range(mm.Platform.getNumPlatforms())]
+
+
+def choose_openmm_platform(requested="auto"):
+    requested = (requested or os.environ.get("MOLGAME_OPENMM_PLATFORM")
+                 or "auto").strip()
+    available = openmm_platform_names()
+    by_lower = {name.lower(): name for name in available}
+
+    if requested.lower() != "auto":
+        name = by_lower.get(requested.lower())
+        if name is None:
+            print(f"Warning: OpenMM platform '{requested}' not available; "
+                  f"available: {', '.join(available)}")
+        else:
+            return mm.Platform.getPlatformByName(name), name
+
+    for name in ("CUDA", "OpenCL", "CPU", "Reference"):
+        if name.lower() in by_lower:
+            actual = by_lower[name.lower()]
+            return mm.Platform.getPlatformByName(actual), actual
+
+    raise RuntimeError("No OpenMM platform available")
+
+
 def gaff_cache_path():
     cwd_path = os.path.abspath("gaff_cache.json")
     source_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -186,7 +213,8 @@ def extract_ion(pdb_path, ion_name):
     return positions
 
 
-def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None):
+def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None,
+            openmm_platform="auto"):
     t0 = time.time()
     has_ligand = lig_name is not None or ligand_file is not None
     ligand_label = lig_name if lig_name else (
@@ -446,12 +474,12 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None):
 
     # ── Simulation ──
     step += 1
-    print(f"[{step}/{nsteps}] Creating simulation (OpenCL) …")
+    platform, platform_name = choose_openmm_platform(openmm_platform)
+    print(f"[{step}/{nsteps}] Creating simulation ({platform_name}) …")
     timestep = cfg["timestep_fs"] * unit.femtoseconds
     integrator = mm.LangevinMiddleIntegrator(
         cfg["temperature"] * unit.kelvin, cfg["friction"] / unit.picosecond, timestep)
     print(f"      Timestep: {cfg['timestep_fs']:.2f} fs")
-    platform = mm.Platform.getPlatformByName("OpenCL")
     ctx = mm.Context(system, integrator, platform)
     ctx.setPositions(all_pos * unit.nanometers)
     print("      Minimizing …")

@@ -16,7 +16,7 @@ Real-time molecular dynamics game powered by [OpenMM](https://openmm.org/). Stee
 - **Live telemetry** — HUD shows total PE, clean PE, and a rolling clean-PE history graph
 - **Snapshots** — Save the current protein/ligand structure from the pause menu, with optional water
 - **Retro pixel UI** — NES/Contra-inspired HUD, scanline CRT overlay, proximity bar, hi-score tracking, pause menu
-- **GPU accelerated** — OpenCL for MD (OpenMM) + OpenGL for rendering, runs at 60 fps
+- **GPU accelerated** — CUDA/OpenCL/CPU OpenMM backend selection + OpenGL rendering
 
 ## Quick Start
 
@@ -48,6 +48,58 @@ python start.py --pdb 1CRN   # Crambin
 ```
 
 PDB files are automatically downloaded from RCSB on first run.
+
+### Windows and WSL
+
+MolGame can run from PowerShell, Anaconda Prompt, macOS/Linux shells, or WSL. Use the same conda/mamba environment on every platform:
+
+```powershell
+mamba env create -f environment.yml
+mamba activate molgame
+python start.py
+```
+
+On native Windows, `run.bat` is also available after activating the environment:
+
+```powershell
+run.bat --pdb 1UBQ
+```
+
+On WSL, a working GUI/OpenGL stack is required. Windows 11 WSLg usually works out of the box. Older WSL setups need an external X server and working `DISPLAY`/OpenGL forwarding. If the window does not open, first verify a simple pygame/OpenGL application can create a window inside WSL.
+
+OpenMM backend selection is automatic by default. The resolver tries `CUDA`, then `OpenCL`, then `CPU`. You can force a backend when needed:
+
+```bash
+python start.py --platform CUDA
+python start.py --platform OpenCL
+python start.py --platform CPU
+```
+
+The same setting can be provided with an environment variable:
+
+```bash
+MOLGAME_OPENMM_PLATFORM=CPU python start.py
+```
+
+### Linux / Ubuntu notes
+
+Native Ubuntu desktop is supported as long as the system can create a Pygame/OpenGL window:
+
+```bash
+mamba env create -f environment.yml
+mamba activate molgame
+python start.py
+```
+
+Ubuntu servers, SSH sessions, containers, and headless machines need extra GUI/OpenGL setup such as X11 forwarding, VirtualGL, or a desktop session. Without a working display, Pygame cannot open the interactive window even if OpenMM itself is installed correctly.
+
+To check which OpenMM compute backends are visible on Ubuntu:
+
+```bash
+python -c "import openmm as mm; print([mm.Platform.getPlatform(i).getName() for i in range(mm.Platform.getNumPlatforms())])"
+```
+
+For NVIDIA systems, `CUDA` is usually preferred. If the automatic resolver picks the wrong backend, force one with `--platform`.
 
 ### Protein + ligand
 
@@ -113,7 +165,7 @@ The pause menu also includes `Force mode`. `Total` divides the requested force a
 
 Real ligands can feel harder to move than selected protein residues because they are usually buried in a pocket and strongly coupled to surrounding atoms. `Lig force x` scales steering force only when controlling the original ligand target.
 
-While paused, press `S` to save the current structure as `molgame_snapshot_YYYYMMDD_HHMMSS_dry.pdb` or `_all.pdb` in the current working directory. The `Save water` menu option controls whether waters are included; the default `No` saves protein and ligand only. Extra particles that are not part of the topology, such as the default probe atom, are not written.
+While paused, choose `Save PDB` and press `Y` on a gamepad or `Enter` on the keyboard to save the current structure. Keyboard `S` is also available as a shortcut. Files are written as `molgame_snapshot_YYYYMMDD_HHMMSS_dry.pdb` or `_all.pdb` in the current working directory. The `Save water` menu option controls whether waters are included; the default `No` saves protein and ligand only. Extra particles that are not part of the topology, such as the default probe atom, are not written.
 
 ## How It Works
 
@@ -121,7 +173,7 @@ While paused, press `S` to save the current structure as `molgame_snapshot_YYYYM
 ┌─────────────┐     ┌──────────────┐     ┌─────────────┐
 │  Pygame      │────▶│  OpenMM      │────▶│  OpenGL     │
 │  Input       │     │  MD Engine   │     │  Renderer   │
-│  WASD/Mouse  │     │  (OpenCL GPU)│     │  (GPU)      │
+│  WASD/Mouse  │     │CUDA/OpenCL/CPU│    │  (GPU)      │
 └─────────────┘     └──────────────┘     └─────────────┘
 ```
 
@@ -158,8 +210,8 @@ While paused, press `S` to save the current structure as `molgame_snapshot_YYYYM
 
 ## Requirements
 
-- macOS or Linux (tested on macOS with Apple Silicon)
-- GPU with OpenCL support
+- macOS, Linux, Windows, or WSL with working OpenGL window support
+- GPU with CUDA or OpenCL support recommended; CPU fallback is available but slower
 - ~2 GB RAM for a typical small protein (~15k atoms with solvent)
 
 ## License
