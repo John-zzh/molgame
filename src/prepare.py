@@ -213,12 +213,19 @@ def extract_ion(pdb_path, ion_name):
     return positions
 
 
-def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None,
+def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_files=None,
             openmm_platform="auto"):
     t0 = time.time()
-    has_ligand = lig_name is not None or ligand_file is not None
+    if ligand_files is None:
+        ligand_files = []
+    elif isinstance(ligand_files, str):
+        ligand_files = [ligand_files]
+    else:
+        ligand_files = list(ligand_files)
+    has_local_ligands = len(ligand_files) > 0
+    has_ligand = lig_name is not None or has_local_ligands
     ligand_label = lig_name if lig_name else (
-        os.path.basename(ligand_file) if ligand_file else None)
+        ", ".join(os.path.basename(path) for path in ligand_files) if ligand_files else None)
     step, nsteps = 0, 8 if has_ligand else 7
 
     ion_positions = None
@@ -232,25 +239,28 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None,
         from openff.toolkit import Molecule as OFFMolecule
         from openmmforcefields.generators import GAFFTemplateGenerator
 
-        if ligand_file:
-            rdkit_mol = load_ligand_file(ligand_file)
+        if has_local_ligands:
+            rdkit_mols = [load_ligand_file(path) for path in ligand_files]
         else:
-            rdkit_mol = extract_ligand(pdb_path, lig_name)
-        off_mol = OFFMolecule.from_rdkit(rdkit_mol, allow_undefined_stereo=True)
+            rdkit_mols = [extract_ligand(pdb_path, lig_name)]
+        off_mols = [OFFMolecule.from_rdkit(mol, allow_undefined_stereo=True)
+                    for mol in rdkit_mols]
         cache_path = gaff_cache_path()
         print(f"     GAFF cache: {cache_path}")
-        gaff = GAFFTemplateGenerator(molecules=off_mol, forcefield="gaff-2.11",
+        gaff = GAFFTemplateGenerator(molecules=off_mols, forcefield="gaff-2.11",
                                      cache=cache_path)
-        lig_top = off_mol.to_topology().to_openmm()
-        lig_pos_q = off_mol.conformers[0].to_openmm()
-        lig_pos_nm = np.array(lig_pos_q.value_in_unit(unit.nanometers))
+        lig_tops = [mol.to_topology().to_openmm() for mol in off_mols]
+        lig_pos_qs = [mol.conformers[0].to_openmm() for mol in off_mols]
+        lig_pos_nms = [np.array(pos_q.value_in_unit(unit.nanometers))
+                       for pos_q in lig_pos_qs]
+        lig_pos_nm = np.vstack(lig_pos_nms)
         lig_center = lig_pos_nm.mean(axis=0)
 
     # ── Fix protein ──
     step += 1
     print(f"[{step}/{nsteps}] Fixing PDB …")
     fixer = PDBFixer(filename=pdb_path)
-    fixer.removeHeterogens(keepWater=not ligand_file)
+    fixer.removeHeterogens(keepWater=not has_local_ligands)
     fixer.findMissingResidues()
     fixer.missingResidues = {}
     fixer.findNonstandardResidues()
@@ -322,10 +332,14 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None,
     if has_ligand:
         step += 1
         print(f"[{step}/{nsteps}] Adding ligand to topology …")
-        n_before_lig = sum(1 for _ in modeller.topology.atoms())
-        modeller.add(lig_top, lig_pos_q)
-        n_lig_atoms = off_mol.n_atoms
-        lig_set = set(range(n_before_lig, n_before_lig + n_lig_atoms))
+        lig_set = set()
+        lig_groups = []
+        for off_mol, lig_top, lig_pos_q in zip(off_mols, lig_tops, lig_pos_qs):
+            n_before_lig = sum(1 for _ in modeller.topology.atoms())
+            modeller.add(lig_top, lig_pos_q)
+            group = np.arange(n_before_lig, n_before_lig + off_mol.n_atoms, dtype=np.int32)
+            lig_groups.append(group)
+            lig_set.update(int(i) for i in group)
 
     # ── Collect atom indices ──
     pos = np.array(modeller.positions.value_in_unit(unit.nanometers))
@@ -436,6 +450,7 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None,
                 ion_indices.append(idx)
             all_pos = np.vstack([pos] + [p.reshape(1, 3) for p in ion_positions])
             ligand = np.array(ion_indices)
+            lig_groups = [np.array([idx], dtype=np.int32) for idx in ion_indices]
             print(f"     Added {len(ion_indices)} {ion_name} ion(s), steering #{1}")
         else:
             lig_idx = system.addParticle(40.0)
@@ -444,6 +459,7 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None,
             tf_map[lig_idx] = tf.addParticle(lig_idx, [0.0, 0.0, 0.0])
             all_pos = np.vstack([pos, [lig_center]])
             ligand = np.array([lig_idx])
+            lig_groups = [np.array([lig_idx], dtype=np.int32)]
         lig_elem = []
         lig_bonds = []
     system.addForce(pf)
@@ -502,7 +518,7 @@ def prepare(pdb_path, cfg, lig_name=None, ion_name=None, ligand_file=None,
     print(f"      Ready in {time.time()-t0:.1f}s\n")
     return (ctx, integrator,
             np.array(prot_idx), np.array(prot_elem),
-            np.array(water_o), ligand, prot_center, surface_data,
+            np.array(water_o), ligand, lig_groups, prot_center, surface_data,
             box_origin, np.diag(box), prot_bonds,
             np.array(lig_elem), lig_bonds,
             pf, pf_map, tf, tf_map, res_atoms, chain_atoms,

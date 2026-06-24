@@ -113,13 +113,16 @@ If the residue name is wrong or missing from the PDB, startup exits with a ligan
 
 ### Local protein and ligand files
 
-Use `--pdb-file` to load a local protein PDB instead of downloading from RCSB. Use `--ligand-file` to add a local ligand from SDF or MOL2. The ligand file should already contain explicit hydrogens and 3D coordinates aligned to the protein coordinate frame.
+Use `--pdb-file` to load a local protein PDB instead of downloading from RCSB. Use `--ligand-file` to add one or more local ligands from SDF or MOL2. Each ligand file should already contain explicit hydrogens and 3D coordinates aligned to the protein coordinate frame.
 
 ```bash
 python start.py --pdb-file ./protein.pdb
 python start.py --pdb-file ./protein.pdb --ligand-file ./ligand.sdf
 python start.py --pdb-file ./protein.pdb --ligand-file ./ligand.mol2
+python start.py --pdb-file ./protein.pdb --ligand-file ./lig1.sdf --ligand-file ./lig2.mol2
 ```
+
+Repeated `--ligand-file` arguments are treated as separate ligand groups. The first ligand starts as the controlled target. Press `X` to enter free/select mode, aim at another ligand, then press `X` again to control that ligand group independently.
 
 `--ligand` and `--ligand-file` are mutually exclusive. `--ion` cannot be combined with ligand control.
 

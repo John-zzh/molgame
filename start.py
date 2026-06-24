@@ -79,23 +79,30 @@ def main():
                         help="Local protein PDB file instead of downloading by PDB ID")
     parser.add_argument("--ligand", default=None,
                         help="Ligand residue name in PDB (e.g. ZMA, ATP)")
-    parser.add_argument("--ligand-file", default=None,
-                        help="Local ligand .sdf or .mol2 file with explicit H and 3D coordinates")
+    parser.add_argument("--ligand-file", action="append", default=None,
+                        help=("Local ligand .sdf or .mol2 file with explicit H and 3D coordinates. "
+                              "Repeat for multiple ligand groups."))
     parser.add_argument("--ion", default=None,
                         help="Control an existing ion in PDB (e.g. CA, NA, MG)")
     parser.add_argument("--platform", default=os.environ.get("MOLGAME_OPENMM_PLATFORM", "auto"),
                         help="OpenMM platform: auto, CUDA, OpenCL, CPU, or Reference")
     args = parser.parse_args()
     lig_name = args.ligand.upper() if args.ligand else None
-    ligand_file = os.path.abspath(args.ligand_file) if args.ligand_file else None
+    ligand_files = []
+    for value in args.ligand_file or []:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                ligand_files.append(os.path.abspath(item))
     ion_name = args.ion.upper() if args.ion else None
 
-    if lig_name and ligand_file:
+    if lig_name and ligand_files:
         parser.error("--ligand and --ligand-file are mutually exclusive")
-    if ion_name and (lig_name or ligand_file):
+    if ion_name and (lig_name or ligand_files):
         parser.error("--ion cannot be combined with --ligand or --ligand-file")
-    if ligand_file and not os.path.exists(ligand_file):
-        parser.error(f"--ligand-file not found: {ligand_file}")
+    for ligand_file in ligand_files:
+        if not os.path.exists(ligand_file):
+            parser.error(f"--ligand-file not found: {ligand_file}")
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     if args.pdb_file:
@@ -115,20 +122,27 @@ def main():
     cfg = load_config()
 
     (ctx, integrator, prot_idx, prot_elem,
-     water_o, ligand, prot_center, surface_data,
+     water_o, ligand, ligand_groups, prot_center, surface_data,
      box_origin, box_lengths, prot_bonds,
      lig_elem, lig_bonds,
      steer_force, steer_map, torque_force, torque_map,
      res_atoms, chain_atoms, ca_traces, atom_records) = prepare(
-        pdb_file, cfg, lig_name, ion_name, ligand_file, args.platform)
-    has_real_ligand = lig_name is not None or ligand_file is not None
+        pdb_file, cfg, lig_name, ion_name, ligand_files, args.platform)
+    has_real_ligand = lig_name is not None or bool(ligand_files)
 
-    if ion_name and len(ligand) > 1:
-        current_target = np.array([ligand[0]])
+    if ligand_groups:
+        current_target = np.array(ligand_groups[0], dtype=np.int32)
     else:
         current_target = ligand.copy()
     home_target = current_target.copy()
     control_mode = "ligand"  # "ligand" → "free" → "residue" → "ligand"
+
+    def same_target(a, b):
+        return len(a) == len(b) and np.array_equal(np.sort(a), np.sort(b))
+
+    def is_ligand_group(target):
+        return any(same_target(target, group) for group in ligand_groups)
+
     atom_to_res = {}
     atom_to_chain = {}
     for rkey, indices in res_atoms.items():
@@ -140,14 +154,16 @@ def main():
 
     def switch_target(new_target):
         nonlocal current_target
-        for idx in current_target:
+        for idx in steer_map:
             if idx in steer_map:
                 steer_force.setParticleParameters(steer_map[idx], idx, [0.0])
         for idx in new_target:
             if idx in steer_map:
                 steer_force.setParticleParameters(steer_map[idx], idx, [1.0])
         steer_force.updateParametersInContext(ctx)
-        current_target = np.array(new_target)
+        current_target = np.array(new_target, dtype=np.int32)
+
+    switch_target(current_target)
 
     torque_atoms = []
 
@@ -637,7 +653,7 @@ def main():
                 fn = np.linalg.norm(f)
                 if fn > 0:
                     f = f / fn * cur_force
-                    if has_real_ligand and np.array_equal(current_target, home_target):
+                    if has_real_ligand and is_ligand_group(current_target):
                         f *= cfg["ligand_force_scale"]
                     if len(current_target) > 1 and int(cfg["force_mode"]) == 0:
                         f /= len(current_target)
@@ -712,6 +728,26 @@ def main():
                     hit_type = None
                     hit_data = None
 
+                    if has_real_ligand and ligand_groups:
+                        best_dr = None
+                        best_group = None
+                        for group in ligand_groups:
+                            atom_pos = pos[group]
+                            offsets = atom_pos - eye
+                            along = np.dot(offsets, ray_dir)
+                            mask = along > 0
+                            if not mask.any():
+                                continue
+                            perp = offsets[mask] - along[mask, None] * ray_dir
+                            dr = np.linalg.norm(perp, axis=1)
+                            bi = int(np.argmin(dr))
+                            if best_dr is None or dr[bi] < best_dr:
+                                best_dr = float(dr[bi])
+                                best_group = group
+                        if best_dr is not None and best_dr < 0.45:
+                            hit_type = "ligand"
+                            hit_data = np.array(best_group, dtype=np.int32)
+
                     if ion_name and len(ligand) > 1:
                         ion_pos = pos[ligand]
                         ion_off = ion_pos - eye
@@ -738,7 +774,11 @@ def main():
                             nearest_atom = int(prot_idx[np.where(mask)[0][bi]])
                             hit_data = nearest_atom
 
-                    if hit_type == "ion":
+                    if hit_type == "ligand":
+                        switch_target(hit_data)
+                        home_target = current_target.copy()
+                        control_mode = "ligand"
+                    elif hit_type == "ion":
                         switch_target([hit_data])
                         home_target = current_target.copy()
                         control_mode = "ligand"
@@ -787,7 +827,7 @@ def main():
             draw_water(pos, water_o, lig_c, cur_wcut)
         draw_ligand(pos, ligand, lig_elem, lig_bond_a, lig_bond_b, lig_bond_colors,
                     is_ion=ion_name is not None,
-                    active_set=set(current_target) if ion_name else None,
+                    active_set=set(current_target) if (ion_name or has_real_ligand) else None,
                     ligand_style=int(cfg["ligand_style"]),
                     show_glow=control_mode != "free")
         if control_mode == "residue":

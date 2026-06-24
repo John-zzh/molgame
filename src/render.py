@@ -251,7 +251,11 @@ def draw_ligand(pos, lig, lig_elem=None, lig_bond_a=None, lig_bond_b=None,
         glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, [1.0, 1.0, 1.0, 1.0])
         glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 50.0)
         if show_glow:
-            center = pos[lig].mean(axis=0)
+            glow_atoms = [idx for idx in lig
+                          if active_set is None or idx in active_set]
+            if not glow_atoms:
+                return
+            center = pos[np.array(glow_atoms, dtype=np.int32)].mean(axis=0)
             glDisable(GL_LIGHTING)
             glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
             glColor4f(*CL["lig_glow"])
