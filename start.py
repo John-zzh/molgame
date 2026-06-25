@@ -544,12 +544,10 @@ def main():
                     else:
                         toggle_fullscreen()
                 elif ev.button == 6:  # Start/Menu
-                    if paused:
-                        paused = False
+                    paused = not paused
+                    if not paused:
                         sync_cfg()
-                        set_mouse_capture(True)
-                    else:
-                        sync_cfg(); pygame.quit(); return
+                    set_mouse_capture(not paused)
                 elif paused:
                     if ev.button == 9:  # LB
                         p = params[menu_sel]

@@ -158,7 +158,7 @@ When multiple matching ions are present, the first starts as the active target. 
 | `F11` | Toggle fullscreen |
 | `ESC` | Quit |
 
-Gamepads are also supported: left stick moves, right stick looks, triggers move vertically, D-pad applies torque, `A` pauses, `B` changes view, `X` selects, and `Y` toggles fullscreen.
+Gamepads are also supported: left stick moves, right stick looks, triggers move vertically, D-pad applies torque, `A` or Start/Menu pauses, `B` changes view, `X` selects, and `Y` toggles fullscreen.
 
 When `X` enters free/select mode, the crosshair turns yellow and the ligand glow is hidden. This is the visual cue that the next `X` press will pick a new target.
 
